@@ -12,7 +12,9 @@ import React, { useMemo, useState } from 'react';
  *  - Lithium-plating risk is charge-specific and strongly temperature/SOC dependent.
  *  - A smooth knee emerges from accelerating degradation rather than a fixed
  *    "chemistry knee EFC".
- *  - Telemetry can calibrate multiplicative ageing parameters against measured SOH.
+ *  - Telemetry REFINES the chemistry priors, not replace them: calibration is a
+ *    bounded, shrinkage-regularized fit (see fitCalibrationToTelemetry) so a
+ *    handful of noisy field points nudges the model instead of overriding it.
  *  - A daily simulation is used internally; the UI graph is decimated for readability.
  */
 
@@ -339,20 +341,46 @@ function simulateYears(params) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Telemetry calibration
+//
+// Design intent: calibration should REFINE the chemistry priors, not replace
+// them. A CSV with only a handful of SOH readings carries real uncertainty,
+// so we:
+//   1. Bound each multiplicative scale to a "refinement band" around 1.0
+//      (SCALE_MIN..SCALE_MAX) instead of letting it range freely.
+//   2. Add a shrinkage penalty, in log-space, that pulls every scale back
+//      toward 1.0 (i.e. back toward the stock prior). The penalty's weight
+//      falls off as 1/sqrt(N), so a 3-point CSV is held close to the prior
+//      while a fleet history with dozens of well-spread readings is allowed
+//      to move further within the band. This mirrors a standard Bayesian/
+//      ridge-regularized fit: trust the data more as evidence accumulates,
+//      but never let it swing the model wildly on sparse samples.
+// ---------------------------------------------------------------------------
+const CALIBRATION_SCALE_MIN = 0.5;
+const CALIBRATION_SCALE_MAX = 1.8;
+const CALIBRATION_REG_BASE = 9; // regularization strength at N=1, decays as 1/sqrt(N)
+
 function fitCalibrationToTelemetry(rows, baseParams) {
   const usable = rows.filter(r => Number.isFinite(r.year) && Number.isFinite(r.soh) && r.soh > 0 && r.soh <= 100);
 
   if (usable.length < 3) {
     return {
       calibration: { calendarScale: 1, cycleScale: 1, platingScale: 1, resistanceScale: 1 },
-      rmse: null, fitted: false,
+      rmse: null, fitted: false, dataPoints: usable.length, regWeight: null, confidence: 'insufficient',
       message: 'At least 3 measured SOH points are required for calibration.'
     };
   }
 
+  const regWeight = CALIBRATION_REG_BASE / Math.sqrt(usable.length);
+  // Rough qualitative label for the UI — purely a function of sample count,
+  // it does not claim statistical rigor, just communicates how tightly the
+  // fit is being held to the priors.
+  const confidence = usable.length >= 24 ? 'strong' : usable.length >= 10 ? 'moderate' : 'light';
+
   let best = { calendarScale: 1, cycleScale: 1, platingScale: 1, resistanceScale: 1 };
 
-  const score = candidate => {
+  const evaluate = candidate => {
     const sim = simulateYears({
       ...baseParams,
       years: Math.max(usable[usable.length - 1].year, 0.1),
@@ -370,27 +398,49 @@ function fitCalibrationToTelemetry(rows, baseParams) {
         count += w;
       }
     });
-    return Math.sqrt(err / Math.max(1, count));
+    const rmse = Math.sqrt(err / Math.max(1, count));
+
+    // Log-space shrinkage toward 1.0 (the unmodified prior). Using log-space
+    // keeps the penalty symmetric between e.g. a 0.7x and a 1/0.7x deviation.
+    const reg = regWeight * (
+      Math.pow(Math.log(candidate.calendarScale), 2) +
+      Math.pow(Math.log(candidate.cycleScale), 2) +
+      Math.pow(Math.log(candidate.platingScale), 2)
+    );
+
+    return { total: rmse + reg, rmse };
   };
 
-  let bestScore = score(best);
+  let bestEval = evaluate(best);
+  let bestScore = bestEval.total;
+  let bestRmse = bestEval.rmse;
+
   for (let pass = 0; pass < 5; pass++) {
     const step = [0.35, 0.18, 0.08, 0.03, 0.01][pass];
     ['calendarScale', 'cycleScale', 'platingScale'].forEach(key => {
-      const candidates = [clamp(best[key] * (1 - step), 0.15, 4), best[key], clamp(best[key] * (1 + step), 0.15, 4)];
+      const candidates = [
+        clamp(best[key] * (1 - step), CALIBRATION_SCALE_MIN, CALIBRATION_SCALE_MAX),
+        best[key],
+        clamp(best[key] * (1 + step), CALIBRATION_SCALE_MIN, CALIBRATION_SCALE_MAX)
+      ];
       candidates.forEach(v => {
         const candidate = { ...best, [key]: v };
-        const s = score(candidate);
-        if (s < bestScore) { best = candidate; bestScore = s; }
+        const ev = evaluate(candidate);
+        if (ev.total < bestScore) { best = candidate; bestScore = ev.total; bestRmse = ev.rmse; }
       });
     });
   }
 
+  const maxDeviationPct = Math.round((CALIBRATION_SCALE_MAX - 1) * 100);
+
   return {
     calibration: best,
-    rmse: Number(bestScore.toFixed(3)),
+    rmse: Number(bestRmse.toFixed(3)),
     fitted: true,
-    message: `Telemetry-fitted SOH RMSE: ${bestScore.toFixed(2)} percentage points.`
+    dataPoints: usable.length,
+    regWeight: Number(regWeight.toFixed(2)),
+    confidence,
+    message: `Telemetry-refined SOH RMSE: ${bestRmse.toFixed(2)} pp · N=${usable.length} (${confidence} evidence) · bounded to \u00b1${maxDeviationPct}% of chemistry priors.`
   };
 }
 
@@ -456,7 +506,8 @@ export default function App() {
     if (!useTelemetryCalibration || !telemetryRows.length) {
       return {
         calibration: { calendarScale: 1, cycleScale: 1, platingScale: 1, resistanceScale: 1 },
-        rmse: null, fitted: false, message: 'Using explicit priors; no telemetry calibration active.'
+        rmse: null, fitted: false, dataPoints: 0, regWeight: null, confidence: null,
+        message: 'Using explicit priors; no telemetry calibration active.'
       };
     }
     return fitCalibrationToTelemetry(telemetryRows, baseSimulationParams);
@@ -934,7 +985,7 @@ export default function App() {
             ))}
 
             <div style={infoBoxStyle}>
-              <strong>Important:</strong> the chemistry values are research-informed priors, not universal properties of every LFP or NMC cell. Uploading measured SOH data enables the in-browser calibration layer to fit ageing-rate multipliers to the selected pack.
+              <strong>Important:</strong> the chemistry values are research-informed priors, not universal properties of every LFP or NMC cell. Uploading measured SOH data enables the in-browser calibration layer to <em>refine</em> those priors within a bounded band — see the Fleet Telemetry tab for how much the fit is allowed to move and why.
             </div>
           </div>
         </div>
@@ -974,6 +1025,7 @@ export default function App() {
               <p><strong>Degradation modes:</strong> capacity fade is separated into LLI and LAM rather than treating all fade as one scalar loss.</p>
               <p><strong>Knee:</strong> acceleration emerges smoothly as SOH falls; there is no fixed chemistry-wide EFC knee.</p>
               <p><strong>Resistance:</strong> accumulated independently from capacity fade and translated into a modest usable-energy accessibility penalty.</p>
+              <p><strong>Telemetry calibration:</strong> a bounded, shrinkage-regularized fit — see the Fleet Telemetry tab — refines calendar/cycle/plating scale factors toward the measured SOH history without discarding the chemistry priors.</p>
             </div>
           </div>
         </div>
@@ -1044,6 +1096,10 @@ export default function App() {
             <button onClick={resetTelemetry} style={secondaryButtonStyle}>Reset telemetry</button>
 
             {parseError && <div style={errorBoxStyle}>{parseError}</div>}
+
+            <div style={infoBoxStyle}>
+              <strong>How calibration works:</strong> the fit is bounded to ±{Math.round((CALIBRATION_SCALE_MAX - 1) * 100)}% of the chemistry prior for each of the calendar, cycle and plating scale factors, and is shrunk back toward the prior (1.0×) in proportion to 1/√N. A 3–5 point CSV will nudge the model gently; a fleet history with 20+ well-spread readings can move it further within that band. It never fully replaces the underlying physics.
+            </div>
           </div>
 
           <div style={panelStyle}>
@@ -1069,7 +1125,14 @@ export default function App() {
                 </div>
 
                 <div style={{ marginTop: 16, padding: 12, borderRadius: 6, border: '1px solid #1e2433', background: '#090a0f' }}>
-                  <div style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase', marginBottom: 5 }}>Calibration status</div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 5 }}>
+                    <div style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase' }}>Calibration status</div>
+                    {calibrationResult.fitted && (
+                      <div style={{ fontSize: 10, fontWeight: 700, color: calibrationResult.confidence === 'strong' ? '#4ade80' : calibrationResult.confidence === 'moderate' ? '#fbbf24' : '#94a3b8', textTransform: 'uppercase' }}>
+                        {calibrationResult.confidence} evidence
+                      </div>
+                    )}
+                  </div>
                   <div style={{ color: calibrationResult.fitted ? '#4ade80' : '#94a3b8', fontSize: 13 }}>
                     {calibrationResult.message}
                   </div>
@@ -1079,7 +1142,7 @@ export default function App() {
                       Cycle × {calibration.cycleScale.toFixed(3)} ·
                       Plating × {calibration.platingScale.toFixed(3)}
                       <br />
-                      SOH fit RMSE: {calibrationResult.rmse} percentage points
+                      SOH fit RMSE: {calibrationResult.rmse} percentage points · shrinkage weight λ={calibrationResult.regWeight}
                     </div>
                   )}
                 </div>
