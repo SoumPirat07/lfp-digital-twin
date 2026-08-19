@@ -14,23 +14,14 @@ import React, { useMemo, useState } from 'react';
  *    "chemistry knee EFC".
  *  - Telemetry can calibrate multiplicative ageing parameters against measured SOH.
  *  - A daily simulation is used internally; the UI graph is decimated for readability.
- *
- * Literature basis:
- *  - Semi-empirical calendar/cycle ageing models commonly use temperature, SOC,
- *    current/C-rate, DOD and time/EFC as stress factors.
- *  - LLI/LAM are useful degradation modes for connecting internal degradation to
- *    capacity fade.
- *  - Resistance growth should be tracked independently from capacity fade.
- *
- * This remains a reduced-order engineering model. Cell-specific calibration is
- * required before using it for warranty or design-release decisions.
  */
 
-const RESEARCH_PRIORS = {
+const DEFAULT_PRIORS = {
   LFP: {
     // Capacity-loss contributions at a nominal reference duty cycle.
-    calendarRefPctAt1yr: 1.10,
-    cycleRefPctPer1000Efc: 8.0,
+    // Adjusted to align with modern prismatic cells (e.g., EVE LF230 SOH = 80% @ ~6000 cycles)
+    calendarRefPctAt1yr: 0.70,
+    cycleRefPctPer1000Efc: 2.5,
     lliShare: 0.68,
     lamShare: 0.32,
 
@@ -50,16 +41,16 @@ const RESEARCH_PRIORS = {
     // Resistance.
     resistanceGrowthPctAt80Loss: 80,
 
-    // Smooth knee: acceleration becomes noticeable at high cumulative ageing.
-    kneeStartSOH: 92,
-    kneeStrength: 0.90,
+    // Smooth knee: LFP stays flatter for longer, breaking downwards closer to 80-85%
+    kneeStartSOH: 82,
+    kneeStrength: 1.50,
 
     // Prior uncertainty used for confidence band.
     priorUncertaintyPct: 18
   },
   NMC: {
-    calendarRefPctAt1yr: 1.45,
-    cycleRefPctPer1000Efc: 10.0,
+    calendarRefPctAt1yr: 1.20,
+    cycleRefPctPer1000Efc: 8.5,
     lliShare: 0.74,
     lamShare: 0.26,
 
@@ -76,8 +67,8 @@ const RESEARCH_PRIORS = {
 
     resistanceGrowthPctAt80Loss: 105,
 
-    kneeStartSOH: 94,
-    kneeStrength: 1.05,
+    kneeStartSOH: 88,
+    kneeStrength: 1.20,
 
     priorUncertaintyPct: 20
   }
@@ -114,8 +105,7 @@ const meanSocStress = (socPct, exponent = 0.6) => {
   return 0.72 + 0.28 * Math.pow(soc / 0.5, exponent);
 };
 
-const platingStress = (tempC, chargeC, chargeEndSoc, chemistry) => {
-  const p = RESEARCH_PRIORS[chemistry];
+const platingStress = (tempC, chargeC, chargeEndSoc, p) => {
   if (chargeC <= p.platingCOnset || chargeEndSoc <= p.platingSocOnset || tempC >= p.platingTempOnsetC) return 0;
 
   const cold = clamp((p.platingTempOnsetC - tempC) / 15, 0, 2.5);
@@ -155,35 +145,20 @@ function derivePackMetrics(series, parallel, ah, voltage, cellIr) {
   };
 }
 
-/*
- * One daily degradation increment.
- *
- * The model stores LLI/LAM as percentages of initial capacity.
- * Resistance is tracked separately in multiplicative form.
- *
- * The "knee" is not an arbitrary EFC switch. Once SOH falls below a
- * chemistry-dependent region, the daily increment is smoothly amplified.
- */
-function degradationStep(state, inputs, chemistry, calibration) {
-  const p = RESEARCH_PRIORS[chemistry];
+function degradationStep(state, inputs, chemistry, calibration, priors) {
+  const p = priors[chemistry];
   const dtYears = Math.max(1 / 365.25, inputs.dtDays / 365.25);
 
-  // Ohmic self-heating: I^2R dissipation at the mean discharge rate lifts the
-  // effective cell temperature above ambient. Initial resistance therefore
-  // feeds back into Arrhenius ageing instead of being a display-only value.
   const dischargeCurrentA = inputs.dischargeC * inputs.nominalAh;
-  const currentPackIrMilliOhm =
-    inputs.initialPackIrMilliOhm * (1 + state.resistanceGrowthPct / 100);
-  const i2rWatts =
-    Math.pow(dischargeCurrentA, 2) * (currentPackIrMilliOhm / 1000);
-  // Lumped thermal model: ~400 W of continuous loss per degC above ambient.
+  const currentPackIrMilliOhm = inputs.initialPackIrMilliOhm * (1 + state.resistanceGrowthPct / 100);
+  const i2rWatts = Math.pow(dischargeCurrentA, 2) * (currentPackIrMilliOhm / 1000);
+  
   const ohmicDeltaT = clamp(i2rWatts / 400, 0, 12);
   const effectiveTempC = inputs.tempC + ohmicDeltaT;
 
   const tempFactor = arrheniusFactor(effectiveTempC, p.calendarEaKJ);
   const calSoc = socStress(inputs.restSocPct, p.calendarSocExponent);
 
-  // Calendar loss is based on the incremental change in sqrt(time).
   const sqrtNow = Math.sqrt(Math.max(0, state.ageYears + dtYears));
   const sqrtPrev = Math.sqrt(Math.max(0, state.ageYears));
   const sqrtIncrement = Math.max(0, sqrtNow - sqrtPrev);
@@ -195,8 +170,6 @@ function degradationStep(state, inputs, chemistry, calibration) {
     sqrtIncrement *
     calibration.calendarScale;
 
-  // Cycle loss is based on EFC increment, not total EFC^0.83.
-  // Discharge C-rate now contributes (charge-weighted) instead of being ignored.
   const effectiveCRate = 0.6 * inputs.chargeC + 0.4 * inputs.dischargeC;
   const cycleStress =
     dodStress(inputs.dodPct, p.cycleDODExponent) *
@@ -210,12 +183,11 @@ function degradationStep(state, inputs, chemistry, calibration) {
     cycleStress *
     calibration.cycleScale;
 
-  // Charging-only plating contribution.
   const plateSeverity = platingStress(
     effectiveTempC,
     inputs.chargeC,
     inputs.chargeEndSocPct,
-    chemistry
+    p
   );
 
   let platingLoss =
@@ -224,11 +196,9 @@ function degradationStep(state, inputs, chemistry, calibration) {
     plateSeverity *
     calibration.platingScale;
 
-  // LLI/LAM partitioning.
   let lli = (calendarLoss + cycleLoss + platingLoss) * p.lliShare;
   let lam = (calendarLoss + cycleLoss) * p.lamShare;
 
-  // A smooth acceleration as the battery enters the high-age region.
   const preSOH = clamp(100 - state.lliPct - state.lamPct, 0, 100);
   const kneeRatio = clamp((p.kneeStartSOH - preSOH) / (p.kneeStartSOH - 70), 0, 1.5);
   const kneeMultiplier = 1 + p.kneeStrength * Math.pow(kneeRatio, 2.2);
@@ -236,10 +206,6 @@ function degradationStep(state, inputs, chemistry, calibration) {
   lli *= kneeMultiplier;
   lam *= kneeMultiplier;
 
-  // Resistance is tracked independently from capacity fade, but its growth is
-  // scaled so that ~20% capacity loss (80% SOH) lands on the chemistry prior
-  // resistanceGrowthPctAt80Loss. The knee multiplier also amplifies resistance
-  // growth, reflecting pore clogging / electrolyte depletion late in life.
   const resistancePerCapacityLossPct = p.resistanceGrowthPctAt80Loss / 20;
   const baseResistanceLossPct =
     (calendarLoss + cycleLoss + platingLoss * 1.15) *
@@ -272,11 +238,7 @@ function stateToMetrics(state, packKwh, efficiencyKmPerKwh, initialIr, nominalVo
 
   const packIr = initialIr * (1 + state.resistanceGrowthPct / 100);
 
-  // Usable energy is capacity-limited, plus an absolute power/voltage-sag
-  // accessibility penalty: sag at 1C discharge is compared against a 5% pack
-  // voltage budget. Higher initial resistance hits this budget sooner, so the
-  // initial IR input now materially affects usable energy late in life.
-  const i1c = (packKwh * 1000) / Math.max(1, nominalVoltage); // amps at 1C
+  const i1c = (packKwh * 1000) / Math.max(1, nominalVoltage);
   const sagFrac = (i1c * (packIr / 1000)) / Math.max(1, nominalVoltage);
   const powerAccessibility = clamp(1 - Math.max(0, sagFrac - 0.05) * 1.5, 0.82, 1);
 
@@ -301,16 +263,10 @@ function stateToMetrics(state, packKwh, efficiencyKmPerKwh, initialIr, nominalVo
 
 function buildUsageProfile(params) {
   const {
-    dailyKm,
-    efficiencyKmPerKwh,
-    packKwh,
-    ambientTempC,
-    cycleDod,
-    chargeCrate,
-    restSoc,
+    dailyKm, efficiencyKmPerKwh, packKwh,
+    ambientTempC, cycleDod, chargeCrate, restSoc,
     chargeEndSoc = Math.min(100, restSoc + cycleDod)
   } = params;
-
   const dailyEfc = (dailyKm / Math.max(0.1, efficiencyKmPerKwh)) / Math.max(0.1, packKwh);
 
   return {
@@ -328,22 +284,10 @@ function buildUsageProfile(params) {
 
 function simulateYears(params) {
   const {
-    years,
-    chemistry,
-    packKwh,
-    efficiencyKmPerKwh,
-    dailyKm,
-    ambientTempC,
-    cycleDod,
-    chargeCrate,
-    restSoc,
-    eolThreshold,
-    calibration,
-    dtDays = 1,
-    startState = null,
-    nominalAh,
-    nominalVoltage,
-    initialIr
+    years, chemistry, packKwh, efficiencyKmPerKwh, dailyKm,
+    ambientTempC, cycleDod, chargeCrate, restSoc, eolThreshold,
+    calibration, priors, dtDays = 1, startState = null,
+    nominalAh, nominalVoltage, initialIr
   } = params;
 
   const usage = buildUsageProfile({
@@ -352,13 +296,8 @@ function simulateYears(params) {
   });
 
   let state = startState || {
-    ageYears: 0,
-    efc: 0,
-    lliPct: 0,
-    lamPct: 0,
-    platingPct: 0,
-    resistanceGrowthPct: 0,
-    breakdown: { calendar: 0, cycling: 0, plating: 0, knee: 0 }
+    ageYears: 0, efc: 0, lliPct: 0, lamPct: 0, platingPct: 0,
+    resistanceGrowthPct: 0, breakdown: { calendar: 0, cycling: 0, plating: 0, knee: 0 }
   };
 
   const totalDays = Math.max(1, Math.round(years * 365.25));
@@ -376,60 +315,41 @@ function simulateYears(params) {
       state: { ...state }
     });
 
-    if (metrics.soh <= eolThreshold && eolDay === null && day > 0) {
-      eolDay = day;
-    }
-
+    if (metrics.soh <= eolThreshold && eolDay === null && day > 0) eolDay = day;
     if (day >= totalDays) break;
 
     state = degradationStep(
       state,
       {
-        dtDays,
-        deltaEfc: usage.dailyEfc * dtDays,
-        tempC: usage.tempC,
-        dodPct: usage.dodPct,
-        chargeC: usage.chargeC,
-        dischargeC: usage.dischargeC,
-        meanSocPct: usage.meanSocPct,
-        restSocPct: usage.restSocPct,
+        dtDays, deltaEfc: usage.dailyEfc * dtDays,
+        tempC: usage.tempC, dodPct: usage.dodPct,
+        chargeC: usage.chargeC, dischargeC: usage.dischargeC,
+        meanSocPct: usage.meanSocPct, restSocPct: usage.restSocPct,
         chargeEndSocPct: usage.chargeEndSocPct,
-        nominalAh,
-        initialPackIrMilliOhm: initialIr
+        nominalAh, initialPackIrMilliOhm: initialIr
       },
-      chemistry,
-      calibration
+      chemistry, calibration, priors
     );
   }
 
   return {
-    dailyPoints,
-    finalState: state,
+    dailyPoints, finalState: state,
     eolYear: eolDay === null ? null : Number((eolDay / 365.25).toFixed(2)),
     efcPerYear: usage.dailyEfc * 365.25
   };
 }
 
 function fitCalibrationToTelemetry(rows, baseParams) {
-  const usable = rows.filter(r =>
-    Number.isFinite(r.year) &&
-    Number.isFinite(r.soh) &&
-    r.soh > 0 &&
-    r.soh <= 100
-  );
+  const usable = rows.filter(r => Number.isFinite(r.year) && Number.isFinite(r.soh) && r.soh > 0 && r.soh <= 100);
 
   if (usable.length < 3) {
     return {
       calibration: { calendarScale: 1, cycleScale: 1, platingScale: 1, resistanceScale: 1 },
-      rmse: null,
-      fitted: false,
+      rmse: null, fitted: false,
       message: 'At least 3 measured SOH points are required for calibration.'
     };
   }
 
-  // Lightweight coordinate-descent fit. This runs entirely in-browser and
-  // intentionally keeps parameters bounded so telemetry cannot create
-  // physically absurd degradation rates.
   let best = { calendarScale: 1, cycleScale: 1, platingScale: 1, resistanceScale: 1 };
 
   const score = candidate => {
@@ -439,42 +359,29 @@ function fitCalibrationToTelemetry(rows, baseParams) {
       calibration: candidate,
       dtDays: 1
     });
-
-    let err = 0;
-    let count = 0;
+    let err = 0; let count = 0;
 
     usable.forEach(obs => {
       const idx = clamp(Math.round(obs.year * 365.25), 0, sim.dailyPoints.length - 1);
       const pred = sim.dailyPoints[idx]?.soh;
       if (Number.isFinite(pred)) {
-        const w = 1 + Math.min(4, obs.year); // slightly emphasize later-life data
+        const w = 1 + Math.min(4, obs.year);
         err += w * Math.pow(pred - obs.soh, 2);
         count += w;
       }
     });
-
     return Math.sqrt(err / Math.max(1, count));
   };
 
   let bestScore = score(best);
-
   for (let pass = 0; pass < 5; pass++) {
     const step = [0.35, 0.18, 0.08, 0.03, 0.01][pass];
-
     ['calendarScale', 'cycleScale', 'platingScale'].forEach(key => {
-      const candidates = [
-        clamp(best[key] * (1 - step), 0.15, 4),
-        best[key],
-        clamp(best[key] * (1 + step), 0.15, 4)
-      ];
-
+      const candidates = [clamp(best[key] * (1 - step), 0.15, 4), best[key], clamp(best[key] * (1 + step), 0.15, 4)];
       candidates.forEach(v => {
         const candidate = { ...best, [key]: v };
         const s = score(candidate);
-        if (s < bestScore) {
-          best = candidate;
-          bestScore = s;
-        }
+        if (s < bestScore) { best = candidate; bestScore = s; }
       });
     });
   }
@@ -483,13 +390,13 @@ function fitCalibrationToTelemetry(rows, baseParams) {
     calibration: best,
     rmse: Number(bestScore.toFixed(3)),
     fitted: true,
-    message: `Telemetry-fitted ageing multipliers. SOH RMSE: ${bestScore.toFixed(2)} percentage points.`
+    message: `Telemetry-fitted SOH RMSE: ${bestScore.toFixed(2)} percentage points.`
   };
 }
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('forecast');
-
+  
   const [packName, setPackName] = useState('Battery Pack Digital Twin');
   const [chemistry, setChemistry] = useState('LFP');
   const [cellModel, setCellModel] = useState('EVE 230K Prismatic');
@@ -497,16 +404,19 @@ export default function App() {
   const [cellVoltage, setCellVoltage] = useState(3.2);
   const [packSeries, setPackSeries] = useState(192);
   const [packParallel, setPackParallel] = useState(2);
-  const [eolThreshold, setEolThreshold] = useState(80);
+  const [eolThreshold, setEolThreshold] = useState(75);
   const [cellIrMilliOhm, setCellIrMilliOhm] = useState(0.18);
 
-  const [efficiencyKmPerKwh, setEfficiencyKmPerKwh] = useState(0.35);
-  const [dailyKm, setDailyKm] = useState(200);
+  const [efficiencyKmPerKwh, setEfficiencyKmPerKwh] = useState(0.45);
+  const [dailyKm, setDailyKm] = useState(180);
   const [ambientTempC, setAmbientTempC] = useState(35);
-  const [chargeCrate, setChargeCrate] = useState(0.5);
+  const [chargeCrate, setChargeCrate] = useState(1);
   const [cycleDod, setCycleDod] = useState(80);
-  const [restSoc, setRestSoc] = useState(60);
+  const [restSoc, setRestSoc] = useState(50);
   const [simulationYears, setSimulationYears] = useState(10);
+  
+  // Custom Prior Override State
+  const [priors, setPriors] = useState(DEFAULT_PRIORS);
 
   const [telemetrySummary, setTelemetrySummary] = useState(null);
   const [telemetryRows, setTelemetryRows] = useState([]);
@@ -521,35 +431,34 @@ export default function App() {
   );
 
   const baseSimulationParams = useMemo(() => ({
-    chemistry,
-    packKwh: packMetrics.nominalKwh,
-    efficiencyKmPerKwh,
-    dailyKm,
-    ambientTempC,
-    cycleDod,
-    chargeCrate,
-    restSoc,
-    eolThreshold,
-    initialIr: packMetrics.packIrMilliOhm,
-    nominalAh: packMetrics.nominalAh,
-    nominalVoltage: packMetrics.nominalVoltage
+    chemistry, packKwh: packMetrics.nominalKwh, efficiencyKmPerKwh, dailyKm,
+    ambientTempC, cycleDod, chargeCrate, restSoc, eolThreshold, priors,
+    initialIr: packMetrics.packIrMilliOhm, nominalAh: packMetrics.nominalAh, nominalVoltage: packMetrics.nominalVoltage
   }), [
     chemistry, packMetrics.nominalKwh, packMetrics.packIrMilliOhm,
-    packMetrics.nominalAh, packMetrics.nominalVoltage,
-    efficiencyKmPerKwh, dailyKm, ambientTempC, cycleDod,
-    chargeCrate, restSoc, eolThreshold
+    packMetrics.nominalAh, packMetrics.nominalVoltage, efficiencyKmPerKwh, 
+    dailyKm, ambientTempC, cycleDod, chargeCrate, restSoc, eolThreshold, priors
   ]);
+
+  const updatePrior = (key, value) => {
+    if (!Number.isNaN(value)) {
+      setPriors(prev => ({
+        ...prev,
+        [chemistry]: {
+          ...prev[chemistry],
+          [key]: value
+        }
+      }));
+    }
+  };
 
   const calibrationResult = useMemo(() => {
     if (!useTelemetryCalibration || !telemetryRows.length) {
       return {
         calibration: { calendarScale: 1, cycleScale: 1, platingScale: 1, resistanceScale: 1 },
-        rmse: null,
-        fitted: false,
-        message: 'Using research priors; no telemetry calibration active.'
+        rmse: null, fitted: false, message: 'Using explicit priors; no telemetry calibration active.'
       };
     }
-
     return fitCalibrationToTelemetry(telemetryRows, baseSimulationParams);
   }, [telemetryRows, useTelemetryCalibration, baseSimulationParams]);
 
@@ -559,8 +468,7 @@ export default function App() {
     const sim = simulateYears({
       ...baseSimulationParams,
       years: Math.max(3, simulationYears),
-      calibration,
-      dtDays: 1
+      calibration, dtDays: 1
     });
 
     let baselinePoints = null;
@@ -572,54 +480,34 @@ export default function App() {
         dtDays: 1
       });
       const displayEveryDays = Math.max(1, Math.round(0.25 * 365.25));
-      baselinePoints = bSim.dailyPoints.filter((p, i) =>
-        i === 0 || i === bSim.dailyPoints.length - 1 || i % displayEveryDays === 0
-      );
+      baselinePoints = bSim.dailyPoints.filter((p, i) => i === 0 || i === bSim.dailyPoints.length - 1 || i % displayEveryDays === 0);
     }
 
     const displayEveryDays = Math.max(1, Math.round(0.25 * 365.25));
-    const points = sim.dailyPoints.filter((p, i) =>
-      i === 0 || i === sim.dailyPoints.length - 1 || i % displayEveryDays === 0
-    );
+    const points = sim.dailyPoints.filter((p, i) => i === 0 || i === sim.dailyPoints.length - 1 || i % displayEveryDays === 0);
 
-    // Overlay measured SOH on the closest displayed points.
     const measured = telemetryRows.filter(r => Number.isFinite(r.year) && Number.isFinite(r.soh));
     points.forEach(p => {
-      let best = null;
-      let bestDist = Infinity;
+      let best = null; let bestDist = Infinity;
       measured.forEach(m => {
         const d = Math.abs(m.year - p.year);
-        if (d < bestDist) {
-          bestDist = d;
-          best = m;
-        }
+        if (d < bestDist) { bestDist = d; best = m; }
       });
       if (best && bestDist < 0.13) p.measuredSoh = best.soh;
     });
 
-    const minSoh = Math.min(
-      ...points.map(p => p.soh),
-      ...(baselinePoints ? baselinePoints.map(p => p.soh) : [])
-    );
+    const minSoh = Math.min(...points.map(p => p.soh), ...(baselinePoints ? baselinePoints.map(p => p.soh) : []));
     const yMin = Math.max(0, Math.floor((minSoh - 4) / 5) * 5);
 
     return {
-      ...sim,
-      points,
-      baselinePoints,
+      ...sim, points, baselinePoints,
       effectiveHorizon: Math.max(1, points[points.length - 1]?.year || 1),
-      yMin,
-      yMax: 100,
-      yRange: Math.max(10, 100 - yMin)
+      yMin, yMax: 100, yRange: Math.max(10, 100 - yMin)
     };
   }, [baseSimulationParams, simulationYears, calibration, telemetryRows, useTelemetryCalibration]);
 
   const currentYear0 = timelineData.points[0] || {};
-  const currentYear5 =
-    timelineData.dailyPoints[Math.min(
-      timelineData.dailyPoints.length - 1,
-      Math.round(5 * 365.25)
-    )] || timelineData.points[timelineData.points.length - 1];
+  const currentYear5 = timelineData.dailyPoints[Math.min(timelineData.dailyPoints.length - 1, Math.round(5 * 365.25))] || timelineData.points[timelineData.points.length - 1];
 
   const handleCSV = (content, fileName) => {
     try {
@@ -731,7 +619,6 @@ export default function App() {
       const minSoc = Math.min(...parsed.map(r => r.socPct));
       const maxSoc = Math.max(...parsed.map(r => r.socPct));
 
-      // Prefer measured distance/current when present; otherwise fall back to app duty cycle.
       const totalDistance = parsed.reduce((s, r) => s + Math.max(0, r.distanceKm), 0);
       const totalAhThroughput = timestamps.length >= 2
         ? parsed.reduce((s, r, i) => {
@@ -762,7 +649,6 @@ export default function App() {
       setTelemetryRows(historicalRows);
       setCsvFileName(fileName);
       
-      // Update operational base settings from telemetry averages
       if (idxDistance >= 0 && totalDistance > 0) {
         setDailyKm(clamp(Math.round(totalDistance / Math.max(1, spanDays)), 5, 1000));
       }
@@ -790,27 +676,17 @@ export default function App() {
   };
 
   const resetTelemetry = () => {
-    setTelemetryRows([]);
-    setTelemetrySummary(null);
-    setCsvFileName('');
-    setParseError('');
-    setUseTelemetryCalibration(true);
+    setTelemetryRows([]); setTelemetrySummary(null); setCsvFileName(''); setParseError(''); setUseTelemetryCalibration(true);
   };
 
   return (
     <div style={{
-      minHeight: '100vh',
-      backgroundColor: '#090a0f',
-      color: '#e2e8f0',
-      fontFamily: 'Inter, system-ui, -apple-system, sans-serif',
-      padding: '20px 24px',
-      boxSizing: 'border-box'
+      minHeight: '100vh', backgroundColor: '#090a0f', color: '#e2e8f0',
+      fontFamily: 'Inter, system-ui, -apple-system, sans-serif', padding: '20px 24px', boxSizing: 'border-box'
     }}>
       <header style={headerStyle}>
         <div style={badgeStyle}>PHYSICS-INFORMED DIGITAL TWIN</div>
-        <h1 style={{ fontSize: '22px', fontWeight: 700, margin: '6px 0 0', color: '#f8fafc' }}>
-          {packName}
-        </h1>
+        <h1 style={{ fontSize: '22px', fontWeight: 700, margin: '6px 0 0', color: '#f8fafc' }}>{packName}</h1>
         <div style={monoSubStyle}>
           {chemistry} | {packMetrics.s}S{packMetrics.p}P ({packMetrics.totalCells} Cells) | {packMetrics.nominalVoltage} V | {packMetrics.nominalAh} Ah | <strong style={{ color: '#38bdf8' }}>{packMetrics.nominalKwh} kWh</strong>
         </div>
@@ -828,6 +704,7 @@ export default function App() {
           ['forecast', '📈 Trajectory Forecast'],
           ['specs', '⚙️ Pack Architecture & Specs'],
           ['breakdown', '🔬 Degradation Breakdown'],
+          ['advanced', '🎛️ Advanced Settings'],
           ['telemetry', `📁 Fleet Telemetry${telemetrySummary ? ` (${telemetrySummary.validRows})` : ''}`]
         ].map(([id, label]) => (
           <button key={id} onClick={() => setActiveTab(id)} style={tabStyle(activeTab === id)}>{label}</button>
@@ -1050,7 +927,7 @@ export default function App() {
               ['Pack Total Ah Capacity', `${packMetrics.nominalAh} Ah`],
               ['Gross Nameplate Energy', `${packMetrics.nominalKwh} kWh`],
               ['Pack Initial DC Resistance', `${packMetrics.packIrMilliOhm} mΩ`],
-              ['Calendar Activation Energy Prior', `${RESEARCH_PRIORS[chemistry].calendarEaKJ} kJ/mol`],
+              ['Calendar Activation Energy Prior', `${priors[chemistry].calendarEaKJ} kJ/mol`],
               ['Model Architecture', 'LLI + LAM + plating + independent resistance']
             ].map(([a, b], i) => (
               <div key={i} style={derivedRowStyle}><span>{a}</span><strong>{b}</strong></div>
@@ -1097,6 +974,33 @@ export default function App() {
               <p><strong>Degradation modes:</strong> capacity fade is separated into LLI and LAM rather than treating all fade as one scalar loss.</p>
               <p><strong>Knee:</strong> acceleration emerges smoothly as SOH falls; there is no fixed chemistry-wide EFC knee.</p>
               <p><strong>Resistance:</strong> accumulated independently from capacity fade and translated into a modest usable-energy accessibility penalty.</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'advanced' && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+          <div style={panelStyle}>
+            <h3 style={sectionHeadingStyle}>Degradation Model Parameters ({chemistry})</h3>
+            <NumberControl label="Calendar Base Fade (% per √yr)" value={priors[chemistry].calendarRefPctAt1yr} step={0.05} min={0.1} max={10} onChange={v => updatePrior('calendarRefPctAt1yr', v)} />
+            <NumberControl label="Cycle Base Fade (% per 1000 EFC)" value={priors[chemistry].cycleRefPctPer1000Efc} step={0.1} min={0.1} max={20} onChange={v => updatePrior('cycleRefPctPer1000Efc', v)} />
+            <NumberControl label="Degradation Knee Onset (SOH %)" value={priors[chemistry].kneeStartSOH} step={1} min={50} max={98} onChange={v => updatePrior('kneeStartSOH', v)} />
+            <NumberControl label="Knee Downward Strength Factor" value={priors[chemistry].kneeStrength} step={0.1} min={0} max={5} onChange={v => updatePrior('kneeStrength', v)} />
+            <NumberControl label="Lithium Plating Temp Threshold (°C)" value={priors[chemistry].platingTempOnsetC} step={1} min={-10} max={30} onChange={v => updatePrior('platingTempOnsetC', v)} />
+            
+            <button onClick={() => setPriors(DEFAULT_PRIORS)} style={{ ...secondaryButtonStyle, marginTop: 24 }}>
+              ↺ Reset Chemistries to Default
+            </button>
+          </div>
+
+          <div style={panelStyle}>
+            <h3 style={sectionHeadingStyle}>Parameter Explanations</h3>
+            <div style={referenceTextStyle}>
+              <p><strong>Calendar Base Fade:</strong> Percentage capacity loss over the first year at reference storage conditions (25°C, 50% SOC). It inherently scales with the square root of time.</p>
+              <p><strong>Cycle Base Fade:</strong> Capacity loss per 1000 Equivalent Full Cycles (EFC) at nominal reference conditions (25°C, 1C rate, and 80% DOD). <br/><br/><em>Note: Modern LFP prismatic cells like the EVE LF230 typically sit in the 2.5% zone (which scales mathematically to yield ~6000 cycles to 80% SOH under standard stress profiles).</em></p>
+              <p><strong>Knee Onset:</strong> The State of Health at which the exponential degradation knee begins to rapidly accelerate capacity fade. LFP usually maintains a flatter curve for longer before kneeing near 80-85%.</p>
+              <p><strong>Knee Strength:</strong> Determines how sharply the continuous degradation rate multipliers scale once the battery dips past the knee onset SOH.</p>
             </div>
           </div>
         </div>
@@ -1182,7 +1086,7 @@ export default function App() {
               </>
             ) : (
               <div style={{ color: '#64748b', fontSize: 12, fontStyle: 'italic' }}>
-                No telemetry loaded. The simulation is running from research-informed priors.
+                No telemetry loaded. The simulation is running from explicitly defined physical priors.
               </div>
             )}
           </div>
