@@ -1,666 +1,1513 @@
-import React, { useState, useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 
-// --- PACK ARCHITECTURE (Montra Super Rhino 55T / EVE LF280K) ---
-const PACK_SPECS = {
-  name: "Montra Super Rhino 55T",
-  cellModel: "EVE LF280K (3.2V 280Ah)",
-  packSeries: 156,
-  packParallel: 2,
-  totalCells: 312,
-  nominalKwh: 279.55,
-  nominalVoltage: 499.2,
-  nominalAh: 560,
-  eolThreshold: 80.0 // 80% SOH is end of life for commercial heavy trucks
+/*
+ * Battery Digital Twin — upgraded degradation engine
+ *
+ * Model philosophy:
+ *  - Semi-empirical / physics-informed rather than claiming a first-principles electrochemical model.
+ *  - Separate degradation states: LLI, LAM and resistance growth.
+ *  - Calendar ageing follows Arrhenius + SOC stress + sqrt(time).
+ *  - Cycle ageing is accumulated incrementally from EFC, DOD, mean SOC,
+ *    temperature and charge/discharge C-rate.
+ *  - Lithium-plating risk is charge-specific and strongly temperature/SOC dependent.
+ *  - A smooth knee emerges from accelerating degradation rather than a fixed
+ *    "chemistry knee EFC".
+ *  - Telemetry can calibrate multiplicative ageing parameters against measured SOH.
+ *  - A daily simulation is used internally; the UI graph is decimated for readability.
+ *
+ * Literature basis:
+ *  - Semi-empirical calendar/cycle ageing models commonly use temperature, SOC,
+ *    current/C-rate, DOD and time/EFC as stress factors.
+ *  - LLI/LAM are useful degradation modes for connecting internal degradation to
+ *    capacity fade.
+ *  - Resistance growth should be tracked independently from capacity fade.
+ *
+ * This remains a reduced-order engineering model. Cell-specific calibration is
+ * required before using it for warranty or design-release decisions.
+ */
+
+const RESEARCH_PRIORS = {
+  LFP: {
+    // Capacity-loss contributions at a nominal reference duty cycle.
+    calendarRefPctAt1yr: 1.10,
+    cycleRefPctPer1000Efc: 8.0,
+    lliShare: 0.68,
+    lamShare: 0.32,
+
+    // Stress exponents / sensitivities.
+    calendarTimeExponent: 0.50,
+    calendarEaKJ: 34,
+    calendarSocExponent: 1.35,
+    cycleDODExponent: 1.10,
+    cycleCExponent: 0.55,
+    cycleSocExponent: 0.55,
+
+    // Plating risk.
+    platingTempOnsetC: 15,
+    platingSocOnset: 70,
+    platingCOnset: 0.35,
+
+    // Resistance.
+    resistanceGrowthPctAt80Loss: 80,
+
+    // Smooth knee: acceleration becomes noticeable at high cumulative ageing.
+    kneeStartSOH: 92,
+    kneeStrength: 0.90,
+
+    // Prior uncertainty used for confidence band.
+    priorUncertaintyPct: 18
+  },
+  NMC: {
+    calendarRefPctAt1yr: 1.45,
+    cycleRefPctPer1000Efc: 10.0,
+    lliShare: 0.74,
+    lamShare: 0.26,
+
+    calendarTimeExponent: 0.50,
+    calendarEaKJ: 42,
+    calendarSocExponent: 1.55,
+    cycleDODExponent: 1.12,
+    cycleCExponent: 0.62,
+    cycleSocExponent: 0.70,
+
+    platingTempOnsetC: 18,
+    platingSocOnset: 65,
+    platingCOnset: 0.30,
+
+    resistanceGrowthPctAt80Loss: 105,
+
+    kneeStartSOH: 94,
+    kneeStrength: 1.05,
+
+    priorUncertaintyPct: 20
+  }
 };
 
-// --- PRE-TRAINED ML WEIGHTS (Stanford-MIT LFP Dataset + EVE Benchmark) ---
-const DEFAULT_ML_WEIGHTS = {
-  bias: 0.85,
-  w_cal: 2.15,      // Calendar aging weight
-  w_cyc: 0.0068,    // Cycling fatigue weight
-  w_knee: 14.5,     // Non-linear capacity drop knee weight
-  w_temp: 0.045,    // Arrhenius thermal feature multiplier
-  w_crate: 0.55,    // C-rate stress exponent
-  w_dod: 1.20       // Depth of discharge exponent
+const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+const safeNum = (x, fallback = 0) => {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : fallback;
 };
+
+const arrheniusFactor = (tempC, eaKJ) => {
+  const T = clamp(tempC, -30, 80) + 273.15;
+  const Tref = 298.15;
+  const R = 8.314;
+  const Ea = eaKJ * 1000;
+  return Math.exp((Ea / R) * (1 / Tref - 1 / T));
+};
+
+const socStress = (socPct, exponent = 1.4) => {
+  const soc = clamp(socPct, 0, 100) / 100;
+  // Low SOC storage is deliberately close to 1; high SOC rises sharply.
+  return 0.65 + 0.35 * Math.pow(Math.max(0.05, soc), exponent) * 2.0;
+};
+
+const dodStress = (dodPct, exponent = 1.1) =>
+  Math.pow(clamp(dodPct, 5, 100) / 80, exponent);
+
+const cRateStress = (cRate, exponent = 0.55) =>
+  Math.pow(Math.max(0.05, cRate) / 0.5, exponent);
+
+const meanSocStress = (socPct, exponent = 0.6) => {
+  const soc = clamp(socPct, 5, 100) / 100;
+  return 0.72 + 0.28 * Math.pow(soc / 0.5, exponent);
+};
+
+const platingStress = (tempC, chargeC, chargeEndSoc, chemistry) => {
+  const p = RESEARCH_PRIORS[chemistry];
+  if (chargeC <= p.platingCOnset || chargeEndSoc <= p.platingSocOnset || tempC >= p.platingTempOnsetC) return 0;
+
+  const cold = clamp((p.platingTempOnsetC - tempC) / 15, 0, 2.5);
+  const highSoc = clamp((chargeEndSoc - p.platingSocOnset) / (100 - p.platingSocOnset), 0, 1.5);
+  const highC = Math.pow(chargeC / p.platingCOnset, 1.45) - 1;
+
+  return Math.max(0, cold) * (0.35 + 0.65 * highSoc) * Math.max(0, highC);
+};
+
+const percentile = (values, p) => {
+  if (!values.length) return 0;
+  const a = [...values].sort((x, y) => x - y);
+  const i = (a.length - 1) * p;
+  const lo = Math.floor(i);
+  const hi = Math.ceil(i);
+  return lo === hi ? a[lo] : a[lo] + (a[hi] - a[lo]) * (i - lo);
+};
+
+function derivePackMetrics(series, parallel, ah, voltage, cellIr) {
+  const s = Math.max(1, Math.round(safeNum(series, 1)));
+  const p = Math.max(1, Math.round(safeNum(parallel, 1)));
+  const a = Math.max(1, safeNum(ah, 1));
+  const v = Math.max(0.5, safeNum(voltage, 3.2));
+  const r = Math.max(0.001, safeNum(cellIr, 0.18));
+  const totalCells = s * p;
+  const nominalVoltage = s * v;
+  const nominalAh = p * a;
+  const nominalKwh = nominalVoltage * nominalAh / 1000;
+  const packIrMilliOhm = r * s / p;
+
+  return {
+    s, p, ah: a, v, totalCells,
+    nominalVoltage: Number(nominalVoltage.toFixed(1)),
+    nominalAh: Number(nominalAh.toFixed(1)),
+    nominalKwh: Number(nominalKwh.toFixed(2)),
+    packIrMilliOhm: Number(packIrMilliOhm.toFixed(2))
+  };
+}
+
+/*
+ * One daily degradation increment.
+ *
+ * The model stores LLI/LAM as percentages of initial capacity.
+ * Resistance is tracked separately in multiplicative form.
+ *
+ * The "knee" is not an arbitrary EFC switch. Once SOH falls below a
+ * chemistry-dependent region, the daily increment is smoothly amplified.
+ */
+function degradationStep(state, inputs, chemistry, calibration) {
+  const p = RESEARCH_PRIORS[chemistry];
+  const dtYears = Math.max(1 / 365.25, inputs.dtDays / 365.25);
+
+  // Ohmic self-heating: I^2R dissipation at the mean discharge rate lifts the
+  // effective cell temperature above ambient. Initial resistance therefore
+  // feeds back into Arrhenius ageing instead of being a display-only value.
+  const dischargeCurrentA = inputs.dischargeC * inputs.nominalAh;
+  const currentPackIrMilliOhm =
+    inputs.initialPackIrMilliOhm * (1 + state.resistanceGrowthPct / 100);
+  const i2rWatts =
+    Math.pow(dischargeCurrentA, 2) * (currentPackIrMilliOhm / 1000);
+  // Lumped thermal model: ~400 W of continuous loss per degC above ambient.
+  const ohmicDeltaT = clamp(i2rWatts / 400, 0, 12);
+  const effectiveTempC = inputs.tempC + ohmicDeltaT;
+
+  const tempFactor = arrheniusFactor(effectiveTempC, p.calendarEaKJ);
+  const calSoc = socStress(inputs.restSocPct, p.calendarSocExponent);
+
+  // Calendar loss is based on the incremental change in sqrt(time).
+  const sqrtNow = Math.sqrt(Math.max(0, state.ageYears + dtYears));
+  const sqrtPrev = Math.sqrt(Math.max(0, state.ageYears));
+  const sqrtIncrement = Math.max(0, sqrtNow - sqrtPrev);
+
+  let calendarLoss =
+    p.calendarRefPctAt1yr *
+    tempFactor *
+    calSoc *
+    sqrtIncrement *
+    calibration.calendarScale;
+
+  // Cycle loss is based on EFC increment, not total EFC^0.83.
+  // Discharge C-rate now contributes (charge-weighted) instead of being ignored.
+  const effectiveCRate = 0.6 * inputs.chargeC + 0.4 * inputs.dischargeC;
+  const cycleStress =
+    dodStress(inputs.dodPct, p.cycleDODExponent) *
+    cRateStress(effectiveCRate, p.cycleCExponent) *
+    meanSocStress(inputs.meanSocPct, p.cycleSocExponent) *
+    arrheniusFactor(effectiveTempC, p.calendarEaKJ * 0.55);
+
+  let cycleLoss =
+    (p.cycleRefPctPer1000Efc / 1000) *
+    inputs.deltaEfc *
+    cycleStress *
+    calibration.cycleScale;
+
+  // Charging-only plating contribution.
+  const plateSeverity = platingStress(
+    effectiveTempC,
+    inputs.chargeC,
+    inputs.chargeEndSocPct,
+    chemistry
+  );
+
+  let platingLoss =
+    0.010 *
+    inputs.deltaEfc *
+    plateSeverity *
+    calibration.platingScale;
+
+  // LLI/LAM partitioning.
+  let lli = (calendarLoss + cycleLoss + platingLoss) * p.lliShare;
+  let lam = (calendarLoss + cycleLoss) * p.lamShare;
+
+  // A smooth acceleration as the battery enters the high-age region.
+  const preSOH = clamp(100 - state.lliPct - state.lamPct, 0, 100);
+  const kneeRatio = clamp((p.kneeStartSOH - preSOH) / (p.kneeStartSOH - 70), 0, 1.5);
+  const kneeMultiplier = 1 + p.kneeStrength * Math.pow(kneeRatio, 2.2);
+
+  lli *= kneeMultiplier;
+  lam *= kneeMultiplier;
+
+  // Resistance is tracked independently from capacity fade, but its growth is
+  // scaled so that ~20% capacity loss (80% SOH) lands on the chemistry prior
+  // resistanceGrowthPctAt80Loss. The knee multiplier also amplifies resistance
+  // growth, reflecting pore clogging / electrolyte depletion late in life.
+  const resistancePerCapacityLossPct = p.resistanceGrowthPctAt80Loss / 20;
+  const baseResistanceLossPct =
+    (calendarLoss + cycleLoss + platingLoss * 1.15) *
+    resistancePerCapacityLossPct *
+    kneeMultiplier *
+    calibration.resistanceScale;
+
+  const resistanceMultiplier =
+    1 + (state.resistanceGrowthPct + baseResistanceLossPct) / 100;
+
+  return {
+    ageYears: state.ageYears + dtYears,
+    efc: state.efc + inputs.deltaEfc,
+    lliPct: state.lliPct + lli,
+    lamPct: state.lamPct + lam,
+    platingPct: state.platingPct + platingLoss,
+    resistanceGrowthPct: Math.max(0, resistanceMultiplier * 100 - 100),
+    breakdown: {
+      calendar: state.breakdown.calendar + calendarLoss,
+      cycling: state.breakdown.cycling + cycleLoss,
+      plating: state.breakdown.plating + platingLoss,
+      knee: state.breakdown.knee + (calendarLoss + cycleLoss + platingLoss) * Math.max(0, kneeMultiplier - 1)
+    }
+  };
+}
+
+function stateToMetrics(state, packKwh, efficiencyKmPerKwh, initialIr, nominalVoltage) {
+  const capacityLoss = clamp(state.lliPct + state.lamPct, 0, 99.9);
+  const soh = clamp(100 - capacityLoss, 0, 100);
+
+  const packIr = initialIr * (1 + state.resistanceGrowthPct / 100);
+
+  // Usable energy is capacity-limited, plus an absolute power/voltage-sag
+  // accessibility penalty: sag at 1C discharge is compared against a 5% pack
+  // voltage budget. Higher initial resistance hits this budget sooner, so the
+  // initial IR input now materially affects usable energy late in life.
+  const i1c = (packKwh * 1000) / Math.max(1, nominalVoltage); // amps at 1C
+  const sagFrac = (i1c * (packIr / 1000)) / Math.max(1, nominalVoltage);
+  const powerAccessibility = clamp(1 - Math.max(0, sagFrac - 0.05) * 1.5, 0.82, 1);
+
+  const usableKwh = packKwh * soh / 100 * powerAccessibility;
+  const rangeKm = usableKwh * efficiencyKmPerKwh;
+
+  return {
+    soh: Number(soh.toFixed(2)),
+    usableKwh: Number(usableKwh.toFixed(1)),
+    rangeKm: Math.round(rangeKm),
+    packIr: Number(packIr.toFixed(2)),
+    irMultiplier: Number((1 + state.resistanceGrowthPct / 100).toFixed(3)),
+    totalEfc: Math.round(state.efc),
+    breakdown: {
+      calendar: Number(state.breakdown.calendar.toFixed(2)),
+      cycling: Number(state.breakdown.cycling.toFixed(2)),
+      plating: Number(state.breakdown.plating.toFixed(2)),
+      knee: Number(state.breakdown.knee.toFixed(2))
+    }
+  };
+}
+
+function buildUsageProfile(params) {
+  const {
+    dailyKm,
+    efficiencyKmPerKwh,
+    packKwh,
+    ambientTempC,
+    cycleDod,
+    chargeCrate,
+    restSoc,
+    chargeEndSoc = Math.min(100, restSoc + cycleDod)
+  } = params;
+
+  const dailyEfc = (dailyKm / Math.max(0.1, efficiencyKmPerKwh)) / Math.max(0.1, packKwh);
+
+  return {
+    dailyKm,
+    dailyEfc: Math.max(0, dailyEfc),
+    tempC: ambientTempC,
+    dodPct: cycleDod,
+    chargeC: chargeCrate,
+    dischargeC: Math.max(0.1, chargeCrate * 0.75),
+    meanSocPct: clamp(restSoc + cycleDod / 2, 5, 100),
+    restSocPct: restSoc,
+    chargeEndSocPct: chargeEndSoc
+  };
+}
+
+function simulateYears(params) {
+  const {
+    years,
+    chemistry,
+    packKwh,
+    efficiencyKmPerKwh,
+    dailyKm,
+    ambientTempC,
+    cycleDod,
+    chargeCrate,
+    restSoc,
+    eolThreshold,
+    calibration,
+    dtDays = 1,
+    startState = null,
+    nominalAh,
+    nominalVoltage,
+    initialIr
+  } = params;
+
+  const usage = buildUsageProfile({
+    dailyKm, efficiencyKmPerKwh, packKwh,
+    ambientTempC, cycleDod, chargeCrate, restSoc
+  });
+
+  let state = startState || {
+    ageYears: 0,
+    efc: 0,
+    lliPct: 0,
+    lamPct: 0,
+    platingPct: 0,
+    resistanceGrowthPct: 0,
+    breakdown: { calendar: 0, cycling: 0, plating: 0, knee: 0 }
+  };
+
+  const totalDays = Math.max(1, Math.round(years * 365.25));
+  const dailyPoints = [];
+  let eolDay = null;
+
+  for (let day = 0; day <= totalDays; day += dtDays) {
+    const metrics = stateToMetrics(state, packKwh, efficiencyKmPerKwh, initialIr, nominalVoltage);
+
+    dailyPoints.push({
+      day,
+      year: Number((day / 365.25).toFixed(3)),
+      ...metrics,
+      odometerKm: Math.round(day * usage.dailyKm),
+      state: { ...state }
+    });
+
+    if (metrics.soh <= eolThreshold && eolDay === null && day > 0) {
+      eolDay = day;
+    }
+
+    if (day >= totalDays) break;
+
+    state = degradationStep(
+      state,
+      {
+        dtDays,
+        deltaEfc: usage.dailyEfc * dtDays,
+        tempC: usage.tempC,
+        dodPct: usage.dodPct,
+        chargeC: usage.chargeC,
+        dischargeC: usage.dischargeC,
+        meanSocPct: usage.meanSocPct,
+        restSocPct: usage.restSocPct,
+        chargeEndSocPct: usage.chargeEndSocPct,
+        nominalAh,
+        initialPackIrMilliOhm: initialIr
+      },
+      chemistry,
+      calibration
+    );
+  }
+
+  return {
+    dailyPoints,
+    finalState: state,
+    eolYear: eolDay === null ? null : Number((eolDay / 365.25).toFixed(2)),
+    efcPerYear: usage.dailyEfc * 365.25
+  };
+}
+
+function fitCalibrationToTelemetry(rows, baseParams) {
+  const usable = rows.filter(r =>
+    Number.isFinite(r.year) &&
+    Number.isFinite(r.soh) &&
+    r.soh > 0 &&
+    r.soh <= 100
+  );
+
+  if (usable.length < 3) {
+    return {
+      calibration: { calendarScale: 1, cycleScale: 1, platingScale: 1, resistanceScale: 1 },
+      rmse: null,
+      fitted: false,
+      message: 'At least 3 measured SOH points are required for calibration.'
+    };
+  }
+
+  // Lightweight coordinate-descent fit. This runs entirely in-browser and
+  // intentionally keeps parameters bounded so telemetry cannot create
+  // physically absurd degradation rates.
+  let best = { calendarScale: 1, cycleScale: 1, platingScale: 1, resistanceScale: 1 };
+
+  const score = candidate => {
+    const sim = simulateYears({
+      ...baseParams,
+      years: Math.max(usable[usable.length - 1].year, 0.1),
+      calibration: candidate,
+      dtDays: 1
+    });
+
+    let err = 0;
+    let count = 0;
+
+    usable.forEach(obs => {
+      const idx = clamp(Math.round(obs.year * 365.25), 0, sim.dailyPoints.length - 1);
+      const pred = sim.dailyPoints[idx]?.soh;
+      if (Number.isFinite(pred)) {
+        const w = 1 + Math.min(4, obs.year); // slightly emphasize later-life data
+        err += w * Math.pow(pred - obs.soh, 2);
+        count += w;
+      }
+    });
+
+    return Math.sqrt(err / Math.max(1, count));
+  };
+
+  let bestScore = score(best);
+
+  for (let pass = 0; pass < 5; pass++) {
+    const step = [0.35, 0.18, 0.08, 0.03, 0.01][pass];
+
+    ['calendarScale', 'cycleScale', 'platingScale'].forEach(key => {
+      const candidates = [
+        clamp(best[key] * (1 - step), 0.15, 4),
+        best[key],
+        clamp(best[key] * (1 + step), 0.15, 4)
+      ];
+
+      candidates.forEach(v => {
+        const candidate = { ...best, [key]: v };
+        const s = score(candidate);
+        if (s < bestScore) {
+          best = candidate;
+          bestScore = s;
+        }
+      });
+    });
+  }
+
+  return {
+    calibration: best,
+    rmse: Number(bestScore.toFixed(3)),
+    fitted: true,
+    message: `Telemetry-fitted ageing multipliers. SOH RMSE: ${bestScore.toFixed(2)} percentage points.`
+  };
+}
 
 export default function App() {
-  // Mode: 'pretrained_piml' | 'hybrid_transfer'
-  const [mlMode, setMlMode] = useState('pretrained_piml');
+  const [activeTab, setActiveTab] = useState('forecast');
 
-  // Input states (stored as raw numbers/strings for smooth typing)
+  const [packName, setPackName] = useState('Battery Pack Digital Twin');
+  const [chemistry, setChemistry] = useState('LFP');
+  const [cellModel, setCellModel] = useState('EVE 230K Prismatic');
+  const [cellAh, setCellAh] = useState(230);
+  const [cellVoltage, setCellVoltage] = useState(3.2);
+  const [packSeries, setPackSeries] = useState(192);
+  const [packParallel, setPackParallel] = useState(2);
+  const [eolThreshold, setEolThreshold] = useState(80);
+  const [cellIrMilliOhm, setCellIrMilliOhm] = useState(0.18);
+
+  const [efficiencyKmPerKwh, setEfficiencyKmPerKwh] = useState(0.35);
+  const [dailyKm, setDailyKm] = useState(200);
   const [ambientTempC, setAmbientTempC] = useState(35);
-  const [dailyKm, setDailyKm] = useState(280);
-  const [efficiencyKmPerKwh, setEfficiencyKmPerKwh] = useState(0.85);
   const [chargeCrate, setChargeCrate] = useState(0.5);
   const [cycleDod, setCycleDod] = useState(80);
   const [restSoc, setRestSoc] = useState(60);
-  const [simulationYears, setSimulationYears] = useState(8);
+  const [simulationYears, setSimulationYears] = useState(10);
 
-  // Hybrid Telemetry State
-  const [csvFileName, setCsvFileName] = useState("");
-  const [telemetryStats, setTelemetryStats] = useState(null);
-  const [activeWeights, setActiveWeights] = useState(DEFAULT_ML_WEIGHTS);
-  const [mlFitScore, setMlFitScore] = useState({ r2: 0.968, mse: 0.0012 });
-  const [parseError, setParseError] = useState("");
+  const [telemetrySummary, setTelemetrySummary] = useState(null);
+  const [telemetryRows, setTelemetryRows] = useState([]);
+  const [csvFileName, setCsvFileName] = useState('');
+  const [parseError, setParseError] = useState('');
+  const [hoveredPoint, setHoveredPoint] = useState(null);
+  const [useTelemetryCalibration, setUseTelemetryCalibration] = useState(true);
 
-  // Safe numerical extractors
-  const numTemp = parseFloat(ambientTempC) || 25;
-  const numDailyKm = parseFloat(dailyKm) || 100;
-  const numEff = Math.max(0.1, parseFloat(efficiencyKmPerKwh) || 0.85);
-  const numCrate = parseFloat(chargeCrate) || 0.5;
-  const numDod = parseFloat(cycleDod) || 80;
-  const numRestSoc = parseFloat(restSoc) || 50;
-  const numYears = Math.max(2, parseInt(simulationYears) || 8);
+  const packMetrics = useMemo(
+    () => derivePackMetrics(packSeries, packParallel, cellAh, cellVoltage, cellIrMilliOhm),
+    [packSeries, packParallel, cellAh, cellVoltage, cellIrMilliOhm]
+  );
 
-  // --- 1. PHYSICS-INFORMED ML SURROGATE ENGINE ---
-  const runPIMLPrediction = (years, tempC, dodPct, cRate, socRestPct, efcPerYear, weights) => {
-    const Tk = tempC + 273.15;
-    const Tref = 298.15; // 25°C benchmark
-    const days = years * 365.25;
-    const totalEfc = efcPerYear * years;
+  const baseSimulationParams = useMemo(() => ({
+    chemistry,
+    packKwh: packMetrics.nominalKwh,
+    efficiencyKmPerKwh,
+    dailyKm,
+    ambientTempC,
+    cycleDod,
+    chargeCrate,
+    restSoc,
+    eolThreshold,
+    initialIr: packMetrics.packIrMilliOhm,
+    nominalAh: packMetrics.nominalAh,
+    nominalVoltage: packMetrics.nominalVoltage
+  }), [
+    chemistry, packMetrics.nominalKwh, packMetrics.packIrMilliOhm,
+    packMetrics.nominalAh, packMetrics.nominalVoltage,
+    efficiencyKmPerKwh, dailyKm, ambientTempC, cycleDod,
+    chargeCrate, restSoc, eolThreshold
+  ]);
 
-    // Feature 1: Arrhenius Thermal Activation
-    const phi_thermal = Math.exp((38000 / 8.314) * (1 / Tref - 1 / Tk));
+  const calibrationResult = useMemo(() => {
+    if (!useTelemetryCalibration || !telemetryRows.length) {
+      return {
+        calibration: { calendarScale: 1, cycleScale: 1, platingScale: 1, resistanceScale: 1 },
+        rmse: null,
+        fitted: false,
+        message: 'Using research priors; no telemetry calibration active.'
+      };
+    }
 
-    // Feature 2: Diffusive Calendar Aging (SEI growth ~ t^0.55)
-    const phi_soc = Math.pow(socRestPct / 50, 0.75);
-    const q_cal_loss = weights.w_cal * phi_thermal * phi_soc * Math.pow(days / 365.25, 0.55);
+    return fitCalibrationToTelemetry(telemetryRows, baseSimulationParams);
+  }, [telemetryRows, useTelemetryCalibration, baseSimulationParams]);
 
-    // Feature 3: Multi-Stress Cyclic Loss
-    const phi_dod = Math.pow(dodPct / 80, weights.w_dod);
-    const phi_crate = Math.pow(cRate / 0.5, weights.w_crate);
-    const phi_temp_cyc = Math.pow(Tk / 298.15, 1.8);
-    const q_cyc_loss = weights.w_cyc * phi_temp_cyc * phi_crate * phi_dod * Math.pow(Math.max(0, totalEfc), 0.86);
+  const calibration = calibrationResult.calibration;
 
-    // Feature 4: Logistic Non-linear Knee-Point Rollover (Stanford-MIT formulation)
-    // Activated as cumulative cycles exceed ~4,200 EFC
-    const phi_knee = 1 / (1 + Math.exp(-(totalEfc - 4200) / 450));
-    const q_knee_loss = weights.w_knee * phi_knee * Math.max(1, phi_thermal);
+  const timelineData = useMemo(() => {
+    const sim = simulateYears({
+      ...baseSimulationParams,
+      years: Math.max(3, simulationYears),
+      calibration,
+      dtDays: 1
+    });
 
-    // Total ML Capacity Fade (%)
-    const totalLoss = weights.bias + q_cal_loss + q_cyc_loss + q_knee_loss;
-    const soh = Math.max(30, Number((100 - totalLoss).toFixed(2)));
-    const usableKwh = Number(((soh / 100) * PACK_SPECS.nominalKwh).toFixed(1));
-    const fullRangeKm = Number((usableKwh * numEff).toFixed(0));
-    const irMultiplier = Number((1 + (totalLoss * 0.024)).toFixed(2));
+    let baselinePoints = null;
+    if (useTelemetryCalibration && telemetryRows.length > 0) {
+      const bSim = simulateYears({
+        ...baseSimulationParams,
+        years: Math.max(3, simulationYears),
+        calibration: { calendarScale: 1, cycleScale: 1, platingScale: 1, resistanceScale: 1 },
+        dtDays: 1
+      });
+      const displayEveryDays = Math.max(1, Math.round(0.25 * 365.25));
+      baselinePoints = bSim.dailyPoints.filter((p, i) =>
+        i === 0 || i === bSim.dailyPoints.length - 1 || i % displayEveryDays === 0
+      );
+    }
+
+    const displayEveryDays = Math.max(1, Math.round(0.25 * 365.25));
+    const points = sim.dailyPoints.filter((p, i) =>
+      i === 0 || i === sim.dailyPoints.length - 1 || i % displayEveryDays === 0
+    );
+
+    // Overlay measured SOH on the closest displayed points.
+    const measured = telemetryRows.filter(r => Number.isFinite(r.year) && Number.isFinite(r.soh));
+    points.forEach(p => {
+      let best = null;
+      let bestDist = Infinity;
+      measured.forEach(m => {
+        const d = Math.abs(m.year - p.year);
+        if (d < bestDist) {
+          bestDist = d;
+          best = m;
+        }
+      });
+      if (best && bestDist < 0.13) p.measuredSoh = best.soh;
+    });
+
+    const minSoh = Math.min(
+      ...points.map(p => p.soh),
+      ...(baselinePoints ? baselinePoints.map(p => p.soh) : [])
+    );
+    const yMin = Math.max(0, Math.floor((minSoh - 4) / 5) * 5);
 
     return {
-      soh,
-      usableKwh,
-      rangeKm: fullRangeKm,
-      irMultiplier,
-      qLossCal: Number(q_cal_loss.toFixed(2)),
-      qLossCyc: Number(q_cyc_loss.toFixed(2)),
-      qLossKnee: Number(q_knee_loss.toFixed(2)),
-      totalEfc: Math.round(totalEfc)
+      ...sim,
+      points,
+      baselinePoints,
+      effectiveHorizon: Math.max(1, points[points.length - 1]?.year || 1),
+      yMin,
+      yMax: 100,
+      yRange: Math.max(10, 100 - yMin)
     };
-  };
-
-  // --- 2. MULTI-YEAR PROJECTION TIMELINE ---
-  const timelineData = useMemo(() => {
-    const dailyKwhConsumed = numDailyKm / numEff;
-    const baselineEfcPerYear = (dailyKwhConsumed / PACK_SPECS.nominalKwh) * 365.25;
-
-    let effEfcYear = baselineEfcPerYear;
-    let effTemp = numTemp;
-    let effDod = numDod;
-    let effCrate = numCrate;
-    let effRestSoc = numRestSoc;
-
-    if (mlMode === 'hybrid_transfer' && telemetryStats) {
-      effEfcYear = telemetryStats.annualEfc;
-      effTemp = telemetryStats.avgTemp;
-      effDod = telemetryStats.dod;
-      effCrate = telemetryStats.avgCrate;
-      effRestSoc = telemetryStats.avgSoc;
-    }
-
-    const points = [];
-    let eolYear = null;
-
-    for (let yr = 0; yr <= numYears; yr += 0.5) {
-      const res = runPIMLPrediction(yr, effTemp, effDod, effCrate, effRestSoc, effEfcYear, activeWeights);
-
-      if (res.soh <= PACK_SPECS.eolThreshold && eolYear === null && yr > 0) {
-        eolYear = yr;
-      }
-
-      points.push({
-        year: yr,
-        ...res,
-        odometerKm: Math.round(numDailyKm * 365.25 * yr)
-      });
-    }
-
-    return { points, eolYear, efcPerYear: effEfcYear };
-  }, [mlMode, numTemp, numDailyKm, numEff, numCrate, numDod, numRestSoc, numYears, telemetryStats, activeWeights]);
-
-  // --- 3. CSV TELEMETRY PARSER + ONLINE TRANSFER LEARNING ---
-  const parseAndTrainCSV = (csvContent, fileName = "field_telematics.csv") => {
-    try {
-      setParseError("");
-      const lines = csvContent.trim().split('\n');
-      if (lines.length < 2) throw new Error("CSV has no valid telemetry rows.");
-
-      const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
-      const idxCurrent = headers.findIndex(h => h.includes('curr') || h.includes('amp'));
-      const idxSoc = headers.findIndex(h => h.includes('soc'));
-      const idxTemp = headers.findIndex(h => h.includes('temp'));
-      const idxDeltaV = headers.findIndex(h => h.includes('delta') || h.includes('imbal'));
-
-      let sumCurrent = 0, sumTemp = 0, sumSoc = 0, maxDeltaV = 0, validRows = 0;
-      let minSoc = 100, maxSoc = 0;
-
-      for (let i = 1; i < lines.length; i++) {
-        const row = lines[i].split(',').map(v => parseFloat(v.trim()) || 0);
-        if (row.length < headers.length) continue;
-
-        const curr = idxCurrent !== -1 ? Math.abs(row[idxCurrent]) : 135;
-        const soc = idxSoc !== -1 ? row[idxSoc] : 55;
-        const temp = idxTemp !== -1 ? row[idxTemp] : 36;
-        const dv = idxDeltaV !== -1 ? row[idxDeltaV] : 0.018;
-
-        sumCurrent += curr;
-        sumTemp += temp;
-        sumSoc += soc;
-        if (dv > maxDeltaV) maxDeltaV = dv;
-        if (soc < minSoc) minSoc = soc;
-        if (soc > maxSoc) maxSoc = soc;
-        validRows++;
-      }
-
-      const avgCurrent = sumCurrent / validRows;
-      const avgTemp = sumTemp / validRows;
-      const avgSoc = sumSoc / validRows;
-      const extractedDod = Math.max(35, maxSoc - minSoc);
-      const avgCrate = avgCurrent / PACK_SPECS.nominalAh;
-      const annualEfc = ((avgCurrent * 14) / PACK_SPECS.nominalAh) * 365.25;
-
-      // Online Transfer Learning Parameter Update
-      const learnedThermalCorrection = avgTemp > 38 ? 1.15 : (avgTemp < 22 ? 0.92 : 1.0);
-      const learnedCrateCorrection = avgCrate > 0.6 ? 1.12 : 1.0;
-
-      const adaptedWeights = {
-        ...DEFAULT_ML_WEIGHTS,
-        w_cal: Number((DEFAULT_ML_WEIGHTS.w_cal * learnedThermalCorrection).toFixed(3)),
-        w_cyc: Number((DEFAULT_ML_WEIGHTS.w_cyc * learnedCrateCorrection).toFixed(5)),
-        w_knee: Number((DEFAULT_ML_WEIGHTS.w_knee * (avgTemp > 40 ? 1.25 : 1.0)).toFixed(2))
-      };
-
-      setCsvFileName(fileName);
-      setActiveWeights(adaptedWeights);
-      setTelemetryStats({
-        rows: validRows,
-        avgTemp: Number(avgTemp.toFixed(1)),
-        avgSoc: Number(avgSoc.toFixed(1)),
-        dod: Number(extractedDod.toFixed(1)),
-        avgCrate: Number(Math.max(0.2, avgCrate).toFixed(2)),
-        annualEfc: Number(annualEfc.toFixed(0)),
-        maxDeltaV: Number((maxDeltaV * 1000).toFixed(0))
-      });
-
-      setMlFitScore({
-        r2: Number((0.974 - (avgTemp > 40 ? 0.03 : 0.005)).toFixed(3)),
-        mse: 0.0009
-      });
-    } catch (err) {
-      setParseError(err.message);
-    }
-  };
-
-  const handleFileUpload = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (evt) => parseAndTrainCSV(evt.target.result, file.name);
-    reader.readAsText(file);
-  };
-
-  const loadDemoTelemetry = () => {
-    let demoCsv = "timestamp,pack_voltage,pack_current,soc,temp_avg,cell_delta_v\n";
-    const now = Date.now();
-    for (let i = 0; i < 300; i++) {
-      const time = new Date(now + i * 15000).toISOString();
-      const current = (145 + Math.sin(i / 15) * 85).toFixed(1);
-      const voltage = (505 - (i * 0.08)).toFixed(1);
-      const soc = (85 - (i * 0.18)).toFixed(1);
-      const temp = (38 + Math.sin(i / 30) * 4).toFixed(1);
-      const dv = (0.015 + Math.random() * 0.012).toFixed(3);
-      demoCsv += `${time},${voltage},${current},${soc},${temp},${dv}\n`;
-    }
-    parseAndTrainCSV(demoCsv, "Montra_55T_Field_Log_Sample.csv");
-  };
-
-  const resetToPretrained = () => {
-    setMlMode('pretrained_piml');
-    setActiveWeights(DEFAULT_ML_WEIGHTS);
-    setMlFitScore({ r2: 0.968, mse: 0.0012 });
-  };
+  }, [baseSimulationParams, simulationYears, calibration, telemetryRows, useTelemetryCalibration]);
 
   const currentYear0 = timelineData.points[0] || {};
-  const currentYear5 = timelineData.points.find(p => p.year === 5) || timelineData.points[timelineData.points.length - 1];
+  const currentYear5 =
+    timelineData.dailyPoints[Math.min(
+      timelineData.dailyPoints.length - 1,
+      Math.round(5 * 365.25)
+    )] || timelineData.points[timelineData.points.length - 1];
+
+  const handleCSV = (content, fileName) => {
+    try {
+      setParseError('');
+
+      const rawLines = content
+        .replace(/\r/g, '')
+        .split('\n')
+        .filter(line => line.trim().length);
+
+      if (rawLines.length < 2) throw new Error('CSV has fewer than 2 rows.');
+
+      const splitCSV = line => {
+        const out = [];
+        let current = '';
+        let quoted = false;
+
+        for (let i = 0; i < line.length; i++) {
+          const c = line[i];
+          if (c === '"') quoted = !quoted;
+          else if (c === ',' && !quoted) {
+            out.push(current.trim());
+            current = '';
+          } else current += c;
+        }
+        out.push(current.trim());
+        return out;
+      };
+
+      const headers = splitCSV(rawLines[0]).map(h =>
+        h.toLowerCase().replace(/[^a-z0-9]/g, '')
+      );
+
+      const findCol = keys =>
+        headers.findIndex(h => keys.some(k => h.includes(k)));
+
+      const idxTime = findCol(['timestamp', 'datetime', 'date', 'time', 'epoch']);
+      const idxTemp = findCol(['tempc', 'packtemp', 'temperature', 'temp']);
+      const idxSoc = findCol(['socpct', 'soc', 'stateofcharge']);
+      const idxSoh = findCol(['sohpct', 'soh', 'stateofhealth', 'health']);
+      const idxCurrent = findCol(['currenta', 'current']);
+      const idxVoltage = findCol(['voltagev', 'voltage']);
+      const idxDistance = findCol(['distancekm', 'distance', 'km']);
+      const idxDod = findCol(['dodpct', 'dod', 'depthofdischarge']);
+      const idxChargeC = findCol(['chargecrate', 'chargec', 'crate']);
+      const idxDischargeC = findCol(['dischargecrate', 'dischargec']);
+      const idxRestSoc = findCol(['restsocpct', 'restsoc']);
+
+      const parsed = [];
+      let timestamps = [];
+
+      for (let i = 1; i < rawLines.length; i++) {
+        const cols = splitCSV(rawLines[i]);
+        if (!cols.length) continue;
+
+        const temp = idxTemp >= 0 ? safeNum(cols[idxTemp], ambientTempC) : ambientTempC;
+        const soc = idxSoc >= 0 ? safeNum(cols[idxSoc], restSoc) : restSoc;
+        const soh = idxSoh >= 0 ? safeNum(cols[idxSoh], NaN) : NaN;
+        const currentA = idxCurrent >= 0 ? safeNum(cols[idxCurrent], 0) : 0;
+        const voltageV = idxVoltage >= 0 ? safeNum(cols[idxVoltage], packMetrics.nominalVoltage) : packMetrics.nominalVoltage;
+        const distanceKm = idxDistance >= 0 ? safeNum(cols[idxDistance], 0) : 0;
+        const dod = idxDod >= 0 ? safeNum(cols[idxDod], cycleDod) : cycleDod;
+        const chargeC = idxChargeC >= 0 ? safeNum(cols[idxChargeC], chargeCrate) : chargeCrate;
+        const dischargeC = idxDischargeC >= 0 ? safeNum(cols[idxDischargeC], Math.max(0.1, chargeCrate * 0.75)) : Math.max(0.1, chargeCrate * 0.75);
+        const rest = idxRestSoc >= 0 ? safeNum(cols[idxRestSoc], restSoc) : restSoc;
+
+        let epoch = null;
+        if (idxTime >= 0) {
+          const raw = cols[idxTime];
+          const parsedDate = Date.parse(raw);
+          if (!Number.isNaN(parsedDate)) epoch = parsedDate;
+          else {
+            const n = Number(raw);
+            if (Number.isFinite(n)) epoch = n > 1e12 ? n : n * 1000;
+          }
+        }
+
+        if (epoch !== null) timestamps.push(epoch);
+
+        parsed.push({
+          index: i - 1,
+          epoch,
+          tempC: temp,
+          socPct: soc,
+          soh: Number.isFinite(soh) ? clamp(soh, 0, 100) : null,
+          currentA,
+          voltageV,
+          distanceKm,
+          dodPct: dod,
+          chargeC,
+          dischargeC,
+          restSocPct: rest
+        });
+      }
+
+      if (!parsed.length) throw new Error('Could not parse numerical rows.');
+
+      timestamps = timestamps.filter(Number.isFinite).sort((a, b) => a - b);
+
+      let spanDays = Math.max(1, parsed.length);
+      if (timestamps.length >= 2) {
+        spanDays = Math.max(1, (timestamps[timestamps.length - 1] - timestamps[0]) / 86400000);
+      }
+
+      const firstEpoch = timestamps[0] ?? 0;
+      const mean = key =>
+        parsed.reduce((s, r) => s + safeNum(r[key], 0), 0) / Math.max(1, parsed.length);
+
+      const minSoc = Math.min(...parsed.map(r => r.socPct));
+      const maxSoc = Math.max(...parsed.map(r => r.socPct));
+
+      // Prefer measured distance/current when present; otherwise fall back to app duty cycle.
+      const totalDistance = parsed.reduce((s, r) => s + Math.max(0, r.distanceKm), 0);
+      const totalAhThroughput = timestamps.length >= 2
+        ? parsed.reduce((s, r, i) => {
+            if (i === 0 || r.epoch === null || parsed[i - 1].epoch === null) return s;
+            const dtH = Math.max(0, (r.epoch - parsed[i - 1].epoch) / 3600000);
+            return s + Math.abs(r.currentA) * dtH;
+          }, 0)
+        : 0;
+
+      const annualEfcFromAh = totalAhThroughput > 0
+        ? (totalAhThroughput / (2 * packMetrics.nominalAh)) * (365.25 / Math.max(1, spanDays))
+        : 0;
+
+      const annualDistance = totalDistance > 0
+        ? totalDistance * (365.25 / Math.max(1, spanDays))
+        : dailyKm * 365.25;
+
+      const historicalRows = parsed
+        .filter(r => Number.isFinite(r.soh))
+        .map(r => ({
+          year: r.epoch !== null && firstEpoch
+            ? (r.epoch - firstEpoch) / (365.25 * 86400000)
+            : (r.index / Math.max(1, parsed.length - 1)) * (spanDays / 365.25),
+          soh: r.soh
+        }))
+        .filter(r => r.year >= 0);
+
+      setTelemetryRows(historicalRows);
+      setCsvFileName(fileName);
+      
+      // Update operational base settings from telemetry averages
+      if (idxDistance >= 0 && totalDistance > 0) {
+        setDailyKm(clamp(Math.round(totalDistance / Math.max(1, spanDays)), 5, 1000));
+      }
+      setAmbientTempC(clamp(Math.round(mean('tempC')), -10, 60));
+      setRestSoc(clamp(Math.round(mean('socPct')), 10, 100));
+      setCycleDod(clamp(Math.round(mean('dodPct')), 10, 100));
+      setChargeCrate(clamp(Number(mean('chargeC').toFixed(2)), 0.1, 5));
+
+      setTelemetrySummary({
+        validRows: parsed.length,
+        spanDays: Number(spanDays.toFixed(1)),
+        spanYears: Number((spanDays / 365.25).toFixed(2)),
+        meanTemp: Number(mean('tempC').toFixed(1)),
+        meanSoc: Number(mean('socPct').toFixed(1)),
+        meanDod: Number(clamp(maxSoc - minSoc, 0, 100).toFixed(0)),
+        annualEfc: Number((annualEfcFromAh || ((annualDistance / Math.max(0.1, efficiencyKmPerKwh)) / packMetrics.nominalKwh)).toFixed(0)),
+        measuredSohPoints: historicalRows.length,
+        totalDistanceKm: Math.round(totalDistance)
+      });
+    } catch (e) {
+      setParseError(e.message);
+      setTelemetryRows([]);
+      setTelemetrySummary(null);
+    }
+  };
+
+  const resetTelemetry = () => {
+    setTelemetryRows([]);
+    setTelemetrySummary(null);
+    setCsvFileName('');
+    setParseError('');
+    setUseTelemetryCalibration(true);
+  };
 
   return (
-    <div style={{ minHeight: '100vh', backgroundColor: '#070b14', color: '#f1f5f9', fontFamily: 'Inter, -apple-system, sans-serif', padding: '24px' }}>
-      
-      {/* HEADER */}
-      <header style={{ borderBottom: '1px solid #1e293b', paddingBottom: '18px', marginBottom: '22px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '16px' }}>
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
-            <span style={{ background: '#0284c7', color: '#fff', fontSize: '11px', fontWeight: '800', padding: '3px 8px', borderRadius: '4px', letterSpacing: '0.5px' }}>
-              ML DIGITAL TWIN
-            </span>
-            <span style={{ color: '#64748b', fontSize: '13px' }}>Heavy Commercial EV (55T Tractor-Trailer)</span>
-          </div>
-          <h1 style={{ fontSize: '24px', fontWeight: '800', margin: 0, color: '#f8fafc' }}>
-            {PACK_SPECS.name} — 282 kWh Battery Twin
-          </h1>
-          <div style={{ fontSize: '12px', color: '#94a3b8', marginTop: '3px' }}>
-            Cell: <strong style={{ color: '#38bdf8' }}>{PACK_SPECS.cellModel}</strong> | 156S2P Architecture | Usable: 279.55 kWh
-          </div>
-        </div>
-
-        {/* ML MODEL MODE SELECTOR */}
-        <div style={{ display: 'flex', background: '#0f172a', padding: '4px', borderRadius: '8px', border: '1px solid #334155' }}>
-          <button
-            onClick={resetToPretrained}
-            style={{
-              padding: '8px 16px',
-              backgroundColor: mlMode === 'pretrained_piml' ? '#0284c7' : 'transparent',
-              color: mlMode === 'pretrained_piml' ? '#ffffff' : '#94a3b8',
-              border: 'none',
-              borderRadius: '6px',
-              fontWeight: '700',
-              fontSize: '12px',
-              cursor: 'pointer',
-              transition: 'all 0.15s ease'
-            }}>
-            🧠 Pre-trained PIML (Stanford-MIT)
-          </button>
-          <button
-            onClick={() => setMlMode('hybrid_transfer')}
-            style={{
-              padding: '8px 16px',
-              backgroundColor: mlMode === 'hybrid_transfer' ? '#0284c7' : 'transparent',
-              color: mlMode === 'hybrid_transfer' ? '#ffffff' : '#94a3b8',
-              border: 'none',
-              borderRadius: '6px',
-              fontWeight: '700',
-              fontSize: '12px',
-              cursor: 'pointer',
-              transition: 'all 0.15s ease'
-            }}>
-            ⚡ Adaptive Hybrid ML (CSV Telematics)
-          </button>
+    <div style={{
+      minHeight: '100vh',
+      backgroundColor: '#090a0f',
+      color: '#e2e8f0',
+      fontFamily: 'Inter, system-ui, -apple-system, sans-serif',
+      padding: '20px 24px',
+      boxSizing: 'border-box'
+    }}>
+      <header style={headerStyle}>
+        <div style={badgeStyle}>PHYSICS-INFORMED DIGITAL TWIN</div>
+        <h1 style={{ fontSize: '22px', fontWeight: 700, margin: '6px 0 0', color: '#f8fafc' }}>
+          {packName}
+        </h1>
+        <div style={monoSubStyle}>
+          {chemistry} | {packMetrics.s}S{packMetrics.p}P ({packMetrics.totalCells} Cells) | {packMetrics.nominalVoltage} V | {packMetrics.nominalAh} Ah | <strong style={{ color: '#38bdf8' }}>{packMetrics.nominalKwh} kWh</strong>
         </div>
       </header>
 
-      {/* KPI METRIC CARDS */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '14px', marginBottom: '22px' }}>
-        
-        <div style={{ background: '#0f172a', padding: '16px', borderRadius: '10px', border: '1px solid #1e293b' }}>
-          <div style={{ color: '#94a3b8', fontSize: '12px', fontWeight: '600' }}>Initial Full-Charge Range</div>
-          <div style={{ fontSize: '26px', fontWeight: '800', color: '#38bdf8', marginTop: '4px' }}>
-            {currentYear0.rangeKm} <span style={{ fontSize: '14px', fontWeight: '500' }}>km</span>
-          </div>
-          <div style={{ fontSize: '11px', color: '#64748b', marginTop: '2px' }}>
-            {PACK_SPECS.nominalKwh} kWh @ {numEff} km/kWh
-          </div>
-        </div>
-
-        <div style={{ background: '#0f172a', padding: '16px', borderRadius: '10px', border: '1px solid #1e293b' }}>
-          <div style={{ color: '#94a3b8', fontSize: '12px', fontWeight: '600' }}>5-Year Projected Range</div>
-          <div style={{ fontSize: '26px', fontWeight: '800', color: '#4ade80', marginTop: '4px' }}>
-            {currentYear5.rangeKm} <span style={{ fontSize: '14px', fontWeight: '500' }}>km</span>
-          </div>
-          <div style={{ fontSize: '11px', color: '#64748b', marginTop: '2px' }}>
-            {currentYear5.usableKwh} kWh remaining ({currentYear5.soh}% SOH)
-          </div>
-        </div>
-
-        <div style={{ background: '#0f172a', padding: '16px', borderRadius: '10px', border: '1px solid #1e293b' }}>
-          <div style={{ color: '#94a3b8', fontSize: '12px', fontWeight: '600' }}>RUL to 80% EOL</div>
-          <div style={{ fontSize: '26px', fontWeight: '800', color: timelineData.eolYear ? '#fbbf24' : '#38bdf8', marginTop: '4px' }}>
-            {timelineData.eolYear ? `${timelineData.eolYear} Years` : `>${numYears} Years`}
-          </div>
-          <div style={{ fontSize: '11px', color: '#64748b', marginTop: '2px' }}>
-            {timelineData.efcPerYear.toFixed(0)} cycles/yr ({currentYear5.totalEfc} EFC total)
-          </div>
-        </div>
-
-        <div style={{ background: '#0f172a', padding: '16px', borderRadius: '10px', border: '1px solid #1e293b' }}>
-          <div style={{ color: '#94a3b8', fontSize: '12px', fontWeight: '600' }}>ML Confidence (R² Score)</div>
-          <div style={{ fontSize: '26px', fontWeight: '800', color: '#c084fc', marginTop: '4px' }}>
-            {mlFitScore.r2}
-          </div>
-          <div style={{ fontSize: '11px', color: '#64748b', marginTop: '2px' }}>
-            MSE: {mlFitScore.mse} (Surrogate Fit)
-          </div>
-        </div>
-
+      <div style={kpiGridStyle}>
+        <Kpi label="Initial Range Autonomy" value={`${currentYear0.rangeKm} km`} sub={`${packMetrics.nominalKwh} kWh @ ${efficiencyKmPerKwh} km/kWh`} color="#38bdf8" />
+        <Kpi label="5-Year Projected State" value={`${currentYear5.soh}% SOH`} sub={`${currentYear5.usableKwh} kWh · ${currentYear5.rangeKm} km remaining`} color={currentYear5.soh <= eolThreshold ? '#f87171' : '#4ade80'} />
+        <Kpi label={`RUL to ${eolThreshold}% EOL`} value={timelineData.eolYear ? `${timelineData.eolYear} yr` : `>${simulationYears} yr`} sub={`~${timelineData.efcPerYear.toFixed(0)} EFC/yr`} color="#fbbf24" />
+        <Kpi label="Pack DC Resistance" value={`${currentYear5.packIr} mΩ`} sub={`+${((currentYear5.irMultiplier - 1) * 100).toFixed(0)}% vs fresh`} color="#c084fc" />
       </div>
 
-      {/* WORKSPACE: CONTROL PANEL + DUAL CHARTS */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(320px, 370px) 1fr', gap: '20px' }}>
-        
-        {/* LEFT COLUMN: CONTROL PANEL */}
-        <div style={{ background: '#0f172a', padding: '18px', borderRadius: '10px', border: '1px solid #1e293b', display: 'flex', flexDirection: 'column', gap: '14px' }}>
-          
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #1e293b', paddingBottom: '10px' }}>
-            <h2 style={{ fontSize: '15px', fontWeight: '700', margin: 0 }}>
-              {mlMode === 'hybrid_transfer' ? '📂 Telematics Input' : '⚙️ Fleet Operating Features'}
-            </h2>
-            <span style={{ fontSize: '11px', color: '#38bdf8', fontWeight: '600' }}>Live Updating</span>
+      <div style={tabsStyle}>
+        {[
+          ['forecast', '📈 Trajectory Forecast'],
+          ['specs', '⚙️ Pack Architecture & Specs'],
+          ['breakdown', '🔬 Degradation Breakdown'],
+          ['telemetry', `📁 Fleet Telemetry${telemetrySummary ? ` (${telemetrySummary.validRows})` : ''}`]
+        ].map(([id, label]) => (
+          <button key={id} onClick={() => setActiveTab(id)} style={tabStyle(activeTab === id)}>{label}</button>
+        ))}
+      </div>
+
+      {activeTab === 'forecast' && (
+        <div style={responsiveTwoColStyle}>
+          <div style={panelStyle}>
+            <h3 style={sectionHeadingStyle}>Operational Stress Factors</h3>
+            <ControlRange label={`Daily Utilization (${dailyKm} km/day)`} min={30} max={600} step={10} value={dailyKm} onChange={setDailyKm} />
+            <ControlRange label={`Operational Pack Temp (${ambientTempC}°C)`} min={5} max={55} step={1} value={ambientTempC} onChange={setAmbientTempC} />
+            <div style={warningStyle(ambientTempC > 40 || ambientTempC < 15)}>
+              {ambientTempC > 40 ? '⚠ High temperature accelerates calendar/cycle ageing' :
+               ambientTempC < 15 ? '⚠ Low temperature increases charge-side plating risk' :
+               'Normal thermal range'}
+            </div>
+            <ControlRange label={`Fast Charge C-Rate (${chargeCrate}C)`} min={0.2} max={2} step={0.05} value={chargeCrate} onChange={setChargeCrate} />
+            <ControlRange label={`Cycle Depth DOD (${cycleDod}%)`} min={30} max={100} step={5} value={cycleDod} onChange={setCycleDod} />
+            <ControlRange label={`Resting SOC (${restSoc}%)`} min={20} max={95} step={5} value={restSoc} onChange={setRestSoc} />
+            <NumberControl label="Specific Consumption (km/kWh)" value={efficiencyKmPerKwh} step={0.05} min={0.2} max={8} onChange={v => setEfficiencyKmPerKwh(v || 0.35)} />
+            <NumberControl label="Projection Horizon (Years)" value={simulationYears} step={1} min={3} max={20} onChange={v => setSimulationYears(Math.round(v || 8))} />
           </div>
 
-          {mlMode === 'hybrid_transfer' && (
-            <div style={{ background: '#070b14', padding: '12px', borderRadius: '8px', border: '1px solid #1e293b', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-              <p style={{ fontSize: '12px', color: '#94a3b8', margin: 0 }}>
-                Upload CAN-bus telematics CSV to perform on-the-fly transfer learning:
-              </p>
-              
-              <input
-                type="file"
-                accept=".csv"
-                onChange={handleFileUpload}
-                style={{ fontSize: '11px', color: '#94a3b8', width: '100%' }}
-              />
-
-              <button
-                onClick={loadDemoTelemetry}
-                style={{
-                  padding: '8px 12px',
-                  background: '#1e293b',
-                  color: '#38bdf8',
-                  border: '1px solid #38bdf8',
-                  borderRadius: '6px',
-                  fontSize: '12px',
-                  fontWeight: '700',
-                  cursor: 'pointer'
-                }}>
-                ⚡ Load Demo Fleet CSV
-              </button>
-
-              {csvFileName && (
-                <div style={{ fontSize: '12px', color: '#4ade80' }}>
-                  ✓ Adapted to Log: <strong>{csvFileName}</strong>
-                </div>
-              )}
-
-              {parseError && (
-                <div style={{ fontSize: '11px', color: '#f87171', background: '#450a0a', padding: '6px', borderRadius: '4px' }}>
-                  {parseError}
-                </div>
-              )}
-
-              {telemetryStats && (
-                <div style={{ fontSize: '11px', color: '#cbd5e1', lineHeight: '1.6', borderTop: '1px solid #1e293b', paddingTop: '8px' }}>
-                  <div>• Extracted Temp Avg: <strong>{telemetryStats.avgTemp}°C</strong></div>
-                  <div>• Dynamic Cell ΔV: <strong>{telemetryStats.maxDeltaV} mV</strong></div>
-                  <div>• Extracted DOD: <strong>{telemetryStats.dod}%</strong></div>
-                  <div>• Extrapolated Annual EFC: <strong>{telemetryStats.annualEfc} cycles/yr</strong></div>
-                  <div style={{ color: '#4ade80', fontWeight: '700', marginTop: '4px' }}>
-                    ✓ Weights Personalized via Ridge Fit
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+            <div style={panelStyle}>
+              <div style={chartHeaderStyle}>
+                <div>
+                  <h3 style={chartTitleStyle}>SOH & Available Range Fade Trajectory</h3>
+                  <div style={mutedTextStyle}>
+                    Daily degradation engine · quarterly display points · telemetry measured SOH shown as circles
                   </div>
                 </div>
-              )}
-            </div>
-          )}
-
-          {/* NUMERIC FEATURE INPUTS */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-            
-            <div>
-              <label style={{ fontSize: '11px', color: '#94a3b8', display: 'block', marginBottom: '4px' }}>Fleet Efficiency (km/kWh)</label>
-              <input
-                type="number"
-                step="0.05"
-                min="0.1"
-                max="3.0"
-                value={efficiencyKmPerKwh}
-                onChange={(e) => setEfficiencyKmPerKwh(e.target.value)}
-                style={{ width: '100%', padding: '8px', background: '#070b14', border: '1px solid #334155', borderRadius: '6px', color: '#f8fafc', fontWeight: '700', boxSizing: 'border-box' }}
-              />
-            </div>
-
-            <div>
-              <label style={{ fontSize: '11px', color: '#94a3b8', display: 'block', marginBottom: '4px' }}>Daily Driven (km/day)</label>
-              <input
-                type="number"
-                step="10"
-                min="10"
-                max="800"
-                value={dailyKm}
-                onChange={(e) => setDailyKm(e.target.value)}
-                style={{ width: '100%', padding: '8px', background: '#070b14', border: '1px solid #334155', borderRadius: '6px', color: '#f8fafc', fontWeight: '700', boxSizing: 'border-box' }}
-              />
-            </div>
-
-            <div>
-              <label style={{ fontSize: '11px', color: '#94a3b8', display: 'block', marginBottom: '4px' }}>Pack Temp Avg (°C)</label>
-              <input
-                type="number"
-                step="1"
-                min="10"
-                max="55"
-                value={ambientTempC}
-                onChange={(e) => setAmbientTempC(e.target.value)}
-                style={{ width: '100%', padding: '8px', background: '#070b14', border: '1px solid #334155', borderRadius: '6px', color: '#f8fafc', fontWeight: '700', boxSizing: 'border-box' }}
-              />
-            </div>
-
-            <div>
-              <label style={{ fontSize: '11px', color: '#94a3b8', display: 'block', marginBottom: '4px' }}>Cycle Depth DOD (%)</label>
-              <input
-                type="number"
-                step="5"
-                min="20"
-                max="100"
-                value={cycleDod}
-                onChange={(e) => setCycleDod(e.target.value)}
-                style={{ width: '100%', padding: '8px', background: '#070b14', border: '1px solid #334155', borderRadius: '6px', color: '#f8fafc', fontWeight: '700', boxSizing: 'border-box' }}
-              />
-            </div>
-
-            <div>
-              <label style={{ fontSize: '11px', color: '#94a3b8', display: 'block', marginBottom: '4px' }}>Fast Charge Rate (C)</label>
-              <input
-                type="number"
-                step="0.05"
-                min="0.2"
-                max="1.5"
-                value={chargeCrate}
-                onChange={(e) => setChargeCrate(e.target.value)}
-                style={{ width: '100%', padding: '8px', background: '#070b14', border: '1px solid #334155', borderRadius: '6px', color: '#f8fafc', fontWeight: '700', boxSizing: 'border-box' }}
-              />
-            </div>
-
-            <div>
-              <label style={{ fontSize: '11px', color: '#94a3b8', display: 'block', marginBottom: '4px' }}>Resting Idle SOC (%)</label>
-              <input
-                type="number"
-                step="5"
-                min="10"
-                max="100"
-                value={restSoc}
-                onChange={(e) => setRestSoc(e.target.value)}
-                style={{ width: '100%', padding: '8px', background: '#070b14', border: '1px solid #334155', borderRadius: '6px', color: '#f8fafc', fontWeight: '700', boxSizing: 'border-box' }}
-              />
-            </div>
-
-          </div>
-
-          <div>
-            <label style={{ fontSize: '11px', color: '#94a3b8', display: 'block', marginBottom: '4px' }}>Projection Horizon (Years)</label>
-            <input
-              type="number"
-              step="1"
-              min="2"
-              max="15"
-              value={simulationYears}
-              onChange={(e) => setSimulationYears(e.target.value)}
-              style={{ width: '100%', padding: '8px', background: '#070b14', border: '1px solid #334155', borderRadius: '6px', color: '#f8fafc', fontWeight: '700', boxSizing: 'border-box' }}
-            />
-          </div>
-
-          {/* ACTIVE ML WEIGHTS INSPECTOR */}
-          <div style={{ background: '#070b14', padding: '12px', borderRadius: '8px', border: '1px solid #1e293b' }}>
-            <div style={{ fontSize: '12px', fontWeight: '700', color: '#c084fc', marginBottom: '4px' }}>
-              🧠 Active ML Feature Weights
-            </div>
-            <div style={{ fontSize: '11px', color: '#94a3b8', lineHeight: '1.5' }}>
-              • W_cal (Calendar Rate): <strong>{activeWeights.w_cal}</strong><br />
-              • W_cyc (Fatigue Slope): <strong>{activeWeights.w_cyc}</strong><br />
-              • W_knee (Rollover Drop): <strong>{activeWeights.w_knee}</strong><br />
-              • Training Dataset: Stanford-MIT LFP (124 Cells, 0.5M cycles)
-            </div>
-          </div>
-
-        </div>
-
-        {/* RIGHT COLUMN: DUAL-AXIS SOH & RANGE GRAPH + DATA TABLE */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-          
-          {/* DUAL-AXIS SVG GRAPH */}
-          <div style={{ background: '#0f172a', padding: '18px', borderRadius: '10px', border: '1px solid #1e293b' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px', flexWrap: 'wrap', gap: '8px' }}>
-              <div>
-                <h3 style={{ margin: 0, fontSize: '15px', fontWeight: '700' }}>
-                  📉 SOH & Available Range Fade Trajectory
-                </h3>
-                <span style={{ fontSize: '11px', color: '#64748b' }}>
-                  ML-Modeled EFC Demand: ~{timelineData.efcPerYear.toFixed(0)} Cycles/Year
-                </span>
+                <div style={legendStyle}>
+                  <span style={{ color: '#38bdf8' }}>━ {timelineData.baselinePoints ? 'Calibrated SOH' : 'Model SOH'}</span>
+                  {timelineData.baselinePoints && <span style={{ color: '#64748b' }}>┄ Baseline SOH</span>}
+                  <span style={{ color: '#4ade80' }}>┄ Range</span>
+                  <span style={{ color: '#f87171' }}>┄ {eolThreshold}% EOL</span>
+                  {telemetryRows.length > 0 && <span style={{ color: '#fbbf24' }}>● Measured SOH</span>}
+                </div>
               </div>
-              
-              <div style={{ display: 'flex', gap: '14px', fontSize: '11px', fontWeight: '600' }}>
-                <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                  <span style={{ width: '10px', height: '3px', background: '#38bdf8', display: 'inline-block' }}></span>
-                  <span style={{ color: '#38bdf8' }}>SOH (%) [Left]</span>
-                </span>
-                <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                  <span style={{ width: '10px', height: '3px', background: '#4ade80', display: 'inline-block' }}></span>
-                  <span style={{ color: '#4ade80' }}>Range (km) [Right]</span>
-                </span>
-                <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                  <span style={{ width: '10px', height: '2px', background: '#f87171', display: 'inline-block' }}></span>
-                  <span style={{ color: '#f87171' }}>80% EOL</span>
-                </span>
+
+              <div style={{ width: '100%', height: 320, position: 'relative' }}>
+                <svg viewBox="0 0 700 280" style={{ width: '100%', height: '100%', overflow: 'visible' }}>
+                  {[0, 0.25, 0.5, 0.75, 1].map((ratio, idx) => {
+                    const y = 22 + ratio * 210;
+                    const sohVal = timelineData.yMax - ratio * timelineData.yRange;
+                    const rangeVal = Math.round((sohVal / 100) * packMetrics.nominalKwh * efficiencyKmPerKwh);
+                    return (
+                      <g key={idx}>
+                        <line x1="58" y1={y} x2="625" y2={y} stroke="#1e2433" strokeDasharray="3" />
+                        <text x="50" y={y + 4} fill="#64748b" fontSize="10" textAnchor="end" fontFamily="monospace">{sohVal.toFixed(0)}%</text>
+                        <text x="633" y={y + 4} fill="#4ade80" fontSize="10" textAnchor="start" fontFamily="monospace">{Math.max(0, rangeVal)} km</text>
+                      </g>
+                    );
+                  })}
+
+                  {eolThreshold >= timelineData.yMin && eolThreshold <= 100 && (() => {
+                    const y = 22 + ((100 - eolThreshold) / timelineData.yRange) * 210;
+                    return (
+                      <g>
+                        <line x1="58" y1={y} x2="625" y2={y} stroke="#f87171" strokeWidth="1.5" strokeDasharray="4" />
+                        <text x="620" y={y - 5} fill="#f87171" fontSize="9" textAnchor="end">{eolThreshold}% EOL</text>
+                      </g>
+                    );
+                  })()}
+
+                  {(() => {
+                    const pts = timelineData.points;
+                    const maxH = Math.max(1, timelineData.effectiveHorizon);
+                    const getX = yr => 58 + (yr / maxH) * 567;
+                    const getY = soh => 22 + ((100 - Math.max(timelineData.yMin, soh)) / timelineData.yRange) * 210;
+
+                    const maxRange = packMetrics.nominalKwh * efficiencyKmPerKwh;
+                    const rangePath = pts.map((p, i) => {
+                      const equiv = (p.rangeKm / Math.max(0.1, maxRange)) * 100;
+                      return `${i ? 'L' : 'M'} ${getX(p.year)} ${getY(equiv)}`;
+                    }).join(' ');
+
+                    let baselinePath = '';
+                    if (timelineData.baselinePoints) {
+                      baselinePath = timelineData.baselinePoints.map((p, i) => `${i ? 'L' : 'M'} ${getX(p.year)} ${getY(p.soh)}`).join(' ');
+                    }
+
+                    let historyPts = [];
+                    let projPts = [];
+                    const hasTelemetry = telemetryRows.length > 0;
+                    const lastTelemetryYear = hasTelemetry ? Math.max(...telemetryRows.map(r => r.year)) : 0;
+
+                    if (hasTelemetry) {
+                      historyPts = pts.filter(p => p.year <= lastTelemetryYear);
+                      projPts = pts.filter(p => p.year >= lastTelemetryYear);
+                      if (historyPts.length > 0 && projPts.length > 0 && projPts[0].year !== historyPts[historyPts.length - 1].year) {
+                        projPts.unshift(historyPts[historyPts.length - 1]);
+                      }
+                    } else {
+                      historyPts = pts;
+                    }
+
+                    const historyPath = historyPts.map((p, i) => `${i ? 'L' : 'M'} ${getX(p.year)} ${getY(p.soh)}`).join(' ');
+                    const projPath = projPts.map((p, i) => `${i ? 'L' : 'M'} ${getX(p.year)} ${getY(p.soh)}`).join(' ');
+
+                    return (
+                      <g>
+                        <path d={rangePath} fill="none" stroke="#4ade80" strokeWidth="2" strokeDasharray="5 4" opacity="0.85" />
+                        
+                        {baselinePath && <path d={baselinePath} fill="none" stroke="#64748b" strokeWidth="2" opacity="0.6" strokeDasharray="4 4" />}
+                        {historyPath && <path d={historyPath} fill="none" stroke="#38bdf8" strokeWidth="3" />}
+                        {projPath && hasTelemetry && <path d={projPath} fill="none" stroke="#38bdf8" strokeWidth="3" strokeDasharray="6 4" />}
+
+                        {pts.map((p, i) => (
+                          <circle
+                            key={i}
+                            cx={getX(p.year)}
+                            cy={getY(p.soh)}
+                            r="3"
+                            fill="#0284c7"
+                            stroke="#090a0f"
+                            strokeWidth="1.5"
+                            onMouseEnter={() => setHoveredPoint(p)}
+                            style={{ cursor: 'pointer' }}
+                          />
+                        ))}
+
+                        {pts.filter(p => Number.isFinite(p.measuredSoh)).map((p, i) => (
+                          <circle
+                            key={`m-${i}`}
+                            cx={getX(p.year)}
+                            cy={getY(p.measuredSoh)}
+                            r="5"
+                            fill="#fbbf24"
+                            stroke="#090a0f"
+                            strokeWidth="2"
+                          />
+                        ))}
+                      </g>
+                    );
+                  })()}
+
+                  {Array.from({ length: Math.ceil(timelineData.effectiveHorizon) + 1 }).map((_, i) => {
+                    const x = 58 + (i / Math.max(1, timelineData.effectiveHorizon)) * 567;
+                    return <text key={i} x={x} y="258" fill="#64748b" fontSize="10" textAnchor="middle" fontFamily="monospace">Y{i}</text>;
+                  })}
+                </svg>
+
+                {hoveredPoint && (
+                  <div style={tooltipStyle}>
+                    <div style={{ color: '#38bdf8', fontWeight: 700 }}>Year {hoveredPoint.year}</div>
+                    <div>SOH: <strong>{hoveredPoint.soh}%</strong></div>
+                    <div>Usable: {hoveredPoint.usableKwh} kWh</div>
+                    <div>Range: {hoveredPoint.rangeKm} km</div>
+                    <div>R: {hoveredPoint.packIr} mΩ ({hoveredPoint.irMultiplier}×)</div>
+                    <div>EFC: {hoveredPoint.totalEfc}</div>
+                  </div>
+                )}
               </div>
             </div>
 
-            {/* SVG RENDERING */}
-            <div style={{ width: '100%', height: '250px' }}>
-              <svg viewBox="0 0 540 230" style={{ width: '100%', height: '100%', overflow: 'visible' }}>
-                {/* Horizontal Grid */}
-                {[20, 60, 100, 140, 180].map((y, idx) => (
-                  <line key={idx} x1="45" y1={y} x2="495" y2={y} stroke="#1e293b" strokeDasharray="3" />
-                ))}
-
-                {/* Left Y-Axis (SOH %) */}
-                <text x="10" y="24" fill="#38bdf8" fontSize="10" fontWeight="bold">100%</text>
-                <text x="16" y="64" fill="#64748b" fontSize="10">90%</text>
-                <text x="16" y="104" fill="#f87171" fontSize="10" fontWeight="bold">80%</text>
-                <text x="16" y="144" fill="#64748b" fontSize="10">70%</text>
-                <text x="16" y="184" fill="#64748b" fontSize="10">60%</text>
-
-                {/* Right Y-Axis (Range in km) */}
-                {(() => {
-                  const maxRange = Math.round(PACK_SPECS.nominalKwh * numEff);
-                  const minRange = Math.round(maxRange * 0.6);
-                  return (
-                    <>
-                      <text x="502" y="24" fill="#4ade80" fontSize="10" fontWeight="bold">{maxRange} km</text>
-                      <text x="502" y="104" fill="#4ade80" fontSize="10">{Math.round(maxRange * 0.8)} km</text>
-                      <text x="502" y="184" fill="#4ade80" fontSize="10">{minRange} km</text>
-                    </>
-                  );
-                })()}
-
-                {/* 80% EOL Line */}
-                <line x1="45" y1="100" x2="495" y2="100" stroke="#f87171" strokeWidth="1.5" strokeDasharray="4" />
-
-                {/* SOH Curve (Cyan) and Range Curve (Green) */}
-                {(() => {
-                  const pts = timelineData.points;
-                  const maxH = numYears;
-                  const sohPath = pts.map((p, idx) => {
-                    const x = 45 + (p.year / maxH) * 450;
-                    const y = 20 + ((100 - p.soh) / 40) * 160;
-                    return `${idx === 0 ? 'M' : 'L'} ${x} ${Math.min(195, y)}`;
-                  }).join(' ');
-
-                  const rangePath = pts.map((p, idx) => {
-                    const x = 45 + (p.year / maxH) * 450;
-                    const maxR = PACK_SPECS.nominalKwh * numEff;
-                    const minR = maxR * 0.6;
-                    const y = 20 + ((maxR - p.rangeKm) / (maxR - minR)) * 160;
-                    return `${idx === 0 ? 'M' : 'L'} ${x} ${Math.min(195, Math.max(20, y))}`;
-                  }).join(' ');
-
-                  return (
-                    <>
-                      <path d={sohPath} fill="none" stroke="#38bdf8" strokeWidth="3" />
-                      <path d={rangePath} fill="none" stroke="#4ade80" strokeWidth="2.5" strokeDasharray="5 3" />
-                      
-                      {pts.map((p, idx) => {
-                        if (idx % 2 !== 0) return null;
-                        const x = 45 + (p.year / maxH) * 450;
-                        const ySoh = 20 + ((100 - p.soh) / 40) * 160;
-                        return (
-                          <circle key={idx} cx={x} cy={Math.min(195, ySoh)} r="3.5" fill="#0284c7" stroke="#38bdf8" strokeWidth="1.5" />
-                        );
-                      })}
-                    </>
-                  );
-                })()}
-
-                {/* X-Axis Labels */}
-                {Array.from({ length: numYears + 1 }).map((_, i) => (
-                  <text key={i} x={45 + (i / numYears) * 450} y="202" fill="#94a3b8" fontSize="10" textAnchor="middle">
-                    Year {i}
-                  </text>
-                ))}
-              </svg>
-            </div>
-          </div>
-
-          {/* FORECAST DATA TABLE */}
-          <div style={{ background: '#0f172a', padding: '16px', borderRadius: '10px', border: '1px solid #1e293b', overflowX: 'auto' }}>
-            <h4 style={{ margin: '0 0 10px 0', fontSize: '13px', fontWeight: '700', color: '#cbd5e1' }}>
-              📊 Machine Learning Fleet Projection Table
-            </h4>
-            <table style={{ width: '100%', fontSize: '12px', textAlign: 'left', borderCollapse: 'collapse' }}>
-              <thead>
-                <tr style={{ borderBottom: '1px solid #334155', color: '#94a3b8' }}>
-                  <th style={{ padding: '6px' }}>Horizon</th>
-                  <th style={{ padding: '6px' }}>SOH (%)</th>
-                  <th style={{ padding: '6px' }}>Usable Pack</th>
-                  <th style={{ padding: '6px' }}>Full Range</th>
-                  <th style={{ padding: '6px' }}>Odometer</th>
-                  <th style={{ padding: '6px' }}>IR Rise</th>
-                </tr>
-              </thead>
-              <tbody>
-                {timelineData.points.filter((_, idx) => idx % 2 === 0).map((pt, idx) => (
-                  <tr key={idx} style={{ borderBottom: '1px solid #1e293b', color: pt.soh < 80 ? '#f87171' : '#f8fafc' }}>
-                    <td style={{ padding: '6px', fontWeight: '600' }}>Year {pt.year}</td>
-                    <td style={{ padding: '6px', fontWeight: '700', color: pt.soh < 80 ? '#f87171' : '#38bdf8' }}>{pt.soh}%</td>
-                    <td style={{ padding: '6px' }}>{pt.usableKwh} kWh</td>
-                    <td style={{ padding: '6px', color: '#4ade80', fontWeight: '700' }}>{pt.rangeKm} km</td>
-                    <td style={{ padding: '6px', color: '#94a3b8' }}>{(pt.odometerKm / 1000).toFixed(0)}k km</td>
-                    <td style={{ padding: '6px', color: '#c084fc' }}>{pt.irMultiplier}x</td>
+            <div style={{ ...panelStyle, overflowX: 'auto' }}>
+              <h4 style={sectionHeadingStyle}>Quarterly State of Health Schedule</h4>
+              <table style={tableStyle}>
+                <thead>
+                  <tr style={tableHeadStyle}>
+                    <th>Year</th><th>SOH</th><th>Usable Pack</th><th>Range</th><th>EFC</th><th>DC R</th><th>Calendar</th><th>Cycle</th><th>Plating</th><th>Knee</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {timelineData.points.map((pt, i) => (
+                    <tr key={i} style={tableRowStyle(pt.soh <= eolThreshold)}>
+                      <td>{pt.year.toFixed(2)}</td>
+                      <td><strong>{pt.soh}%</strong></td>
+                      <td>{pt.usableKwh} kWh</td>
+                      <td>{pt.rangeKm} km</td>
+                      <td>{pt.totalEfc}</td>
+                      <td>{pt.packIr} mΩ</td>
+                      <td>{pt.breakdown.calendar}%</td>
+                      <td>{pt.breakdown.cycling}%</td>
+                      <td>{pt.breakdown.plating}%</td>
+                      <td>{pt.breakdown.knee}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'specs' && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+          <div style={panelStyle}>
+            <h3 style={sectionHeadingStyle}>Pack Mechanical & Electrical Architecture</h3>
+            <TextControl label="Pack Designation Name" value={packName} onChange={setPackName} />
+            <div style={twoColInputStyle}>
+              <SelectControl label="Cell Chemistry" value={chemistry} onChange={setChemistry} options={[
+                ['LFP', 'LFP (Lithium Iron Phosphate)'],
+                ['NMC', 'NMC (Nickel Manganese Cobalt)']
+              ]} />
+              <TextControl label="Cell Specification Model" value={cellModel} onChange={setCellModel} />
+            </div>
+            <div style={twoColInputStyle}>
+              <NumberControl label="Series Cells (S)" value={packSeries} step={1} min={1} max={1000} onChange={setPackSeries} />
+              <NumberControl label="Parallel Strands (P)" value={packParallel} step={1} min={1} max={50} onChange={setPackParallel} />
+            </div>
+            <div style={twoColInputStyle}>
+              <NumberControl label="Cell Nominal Capacity (Ah)" value={cellAh} step={1} min={10} max={1000} onChange={setCellAh} />
+              <NumberControl label="Cell Nominal Voltage (V)" value={cellVoltage} step={0.05} min={1.5} max={4.5} onChange={setCellVoltage} />
+            </div>
+            <div style={twoColInputStyle}>
+              <NumberControl label="Cell Initial DC Resistance (mΩ)" value={cellIrMilliOhm} step={0.01} min={0.01} max={5} onChange={setCellIrMilliOhm} />
+              <NumberControl label="Fleet EOL Cutoff (%)" value={eolThreshold} step={1} min={50} max={90} onChange={setEolThreshold} />
+            </div>
           </div>
 
+          <div style={panelStyle}>
+            <h3 style={sectionHeadingStyle}>Synthesized Physical Parameters</h3>
+            {[
+              ['Total Cell Count', `${packMetrics.totalCells} cells`],
+              ['Pack Nominal Voltage', `${packMetrics.nominalVoltage} V`],
+              ['Pack Total Ah Capacity', `${packMetrics.nominalAh} Ah`],
+              ['Gross Nameplate Energy', `${packMetrics.nominalKwh} kWh`],
+              ['Pack Initial DC Resistance', `${packMetrics.packIrMilliOhm} mΩ`],
+              ['Calendar Activation Energy Prior', `${RESEARCH_PRIORS[chemistry].calendarEaKJ} kJ/mol`],
+              ['Model Architecture', 'LLI + LAM + plating + independent resistance']
+            ].map(([a, b], i) => (
+              <div key={i} style={derivedRowStyle}><span>{a}</span><strong>{b}</strong></div>
+            ))}
+
+            <div style={infoBoxStyle}>
+              <strong>Important:</strong> the chemistry values are research-informed priors, not universal properties of every LFP or NMC cell. Uploading measured SOH data enables the in-browser calibration layer to fit ageing-rate multipliers to the selected pack.
+            </div>
+          </div>
         </div>
+      )}
 
-      </div>
+      {activeTab === 'breakdown' && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+          <div style={panelStyle}>
+            <h3 style={sectionHeadingStyle}>5-Year Loss Mechanism Partitioning</h3>
+            {[
+              ['LLI / Calendar', currentYear5.breakdown.calendar, '#38bdf8'],
+              ['Cycling / LAM', currentYear5.breakdown.cycling, '#4ade80'],
+              ['Lithium Plating', currentYear5.breakdown.plating, '#f87171'],
+              ['Non-linear Knee Acceleration', currentYear5.breakdown.knee, '#fbbf24']
+            ].map(([name, val, color]) => (
+              <div key={name} style={{ marginBottom: 16 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 5 }}>
+                  <span>{name}</span><span style={{ color, fontFamily: 'monospace' }}>{val}%</span>
+                </div>
+                <div style={{ height: 8, background: '#1e2433', borderRadius: 4 }}>
+                  <div style={{ width: `${Math.min(100, Math.max(0, val * 6))}%`, height: '100%', background: color, borderRadius: 4 }} />
+                </div>
+              </div>
+            ))}
 
+            <div style={infoBoxStyle}>
+              Capacity SOH = 100 − (LLI + LAM). Resistance is intentionally not inferred directly from capacity loss; it is accumulated as a separate state.
+            </div>
+          </div>
+
+          <div style={panelStyle}>
+            <h3 style={sectionHeadingStyle}>Model Architecture & Assumptions</h3>
+            <div style={referenceTextStyle}>
+              <p><strong>Calendar ageing:</strong> Arrhenius temperature dependence, resting-SOC stress and diffusion-like √time growth.</p>
+              <p><strong>Cycle ageing:</strong> incremental EFC accumulation with DOD, mean SOC, C-rate and temperature stress.</p>
+              <p><strong>Lithium plating:</strong> charge-only risk, activated by low temperature, high charging C-rate and high charge-end SOC.</p>
+              <p><strong>Degradation modes:</strong> capacity fade is separated into LLI and LAM rather than treating all fade as one scalar loss.</p>
+              <p><strong>Knee:</strong> acceleration emerges smoothly as SOH falls; there is no fixed chemistry-wide EFC knee.</p>
+              <p><strong>Resistance:</strong> accumulated independently from capacity fade and translated into a modest usable-energy accessibility penalty.</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'telemetry' && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(300px, 380px) 1fr', gap: 20 }}>
+          <div style={panelStyle}>
+            <h3 style={sectionHeadingStyle}>Upload Fleet Telemetry CSV</h3>
+            <p style={mutedParagraphStyle}>
+              Recommended columns: timestamp, temp_C, SOC_pct, SOH_pct, current_A, voltage_V, distance_km, DOD_pct, charge_C, discharge_C, rest_SOC_pct.
+            </p>
+            <input
+              type="file"
+              accept=".csv"
+              onChange={e => {
+                const f = e.target.files?.[0];
+                if (!f) return;
+                const reader = new FileReader();
+                reader.onload = evt => handleCSV(String(evt.target.result), f.name);
+                reader.readAsText(f);
+              }}
+              style={{ fontSize: 12, color: '#94a3b8', width: '100%' }}
+            />
+
+            {csvFileName && (
+              <div style={{ marginTop: 10, color: '#4ade80', fontSize: 12 }}>
+                ✓ Attached: <strong>{csvFileName}</strong>
+              </div>
+            )}
+
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 16, fontSize: 12, color: '#cbd5e1' }}>
+              <input
+                type="checkbox"
+                checked={useTelemetryCalibration}
+                onChange={e => setUseTelemetryCalibration(e.target.checked)}
+              />
+              Calibrate ageing parameters from measured SOH
+            </label>
+
+            <button onClick={resetTelemetry} style={secondaryButtonStyle}>Reset telemetry</button>
+
+            {parseError && <div style={errorBoxStyle}>{parseError}</div>}
+          </div>
+
+          <div style={panelStyle}>
+            <h3 style={sectionHeadingStyle}>Telemetry Diagnostics & Calibration</h3>
+            {telemetrySummary ? (
+              <>
+                {[
+                  ['Valid records', `${telemetrySummary.validRows}`],
+                  ['Time span', `${telemetrySummary.spanDays} days (${telemetrySummary.spanYears} yr)`],
+                  ['Mean battery temperature', `${telemetrySummary.meanTemp}°C`],
+                  ['Mean SOC', `${telemetrySummary.meanSoc}%`],
+                  ['Observed SOC window', `${telemetrySummary.meanDod}% DOD`],
+                  ['Annualized EFC', `${telemetrySummary.annualEfc} EFC/yr`],
+                  ['Measured SOH points', `${telemetrySummary.measuredSohPoints}`],
+                  ['Distance in file', `${telemetrySummary.totalDistanceKm} km`]
+                ].map(([a, b]) => <div key={a} style={derivedRowStyle}><span>{a}</span><strong>{b}</strong></div>)}
+
+                <div style={{ marginTop: 16, padding: 12, borderRadius: 6, border: '1px solid #1e2433', background: '#090a0f' }}>
+                  <div style={{ fontSize: 11, color: '#38bdf8', textTransform: 'uppercase', marginBottom: 5 }}>Settings Auto-Extracted</div>
+                  <div style={{ color: '#cbd5e1', fontSize: 12, lineHeight: 1.5 }}>
+                    Base parameters (temp, DOD, SOC, C-rate, daily km) were automatically updated to reflect the uploaded fleet average. You can override them in the Forecast tab at any time.
+                  </div>
+                </div>
+
+                <div style={{ marginTop: 16, padding: 12, borderRadius: 6, border: '1px solid #1e2433', background: '#090a0f' }}>
+                  <div style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase', marginBottom: 5 }}>Calibration status</div>
+                  <div style={{ color: calibrationResult.fitted ? '#4ade80' : '#94a3b8', fontSize: 13 }}>
+                    {calibrationResult.message}
+                  </div>
+                  {calibrationResult.fitted && (
+                    <div style={{ marginTop: 8, fontFamily: 'monospace', fontSize: 11, color: '#cbd5e1' }}>
+                      Calendar × {calibration.calendarScale.toFixed(3)} ·
+                      Cycle × {calibration.cycleScale.toFixed(3)} ·
+                      Plating × {calibration.platingScale.toFixed(3)}
+                      <br />
+                      SOH fit RMSE: {calibrationResult.rmse} percentage points
+                    </div>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div style={{ color: '#64748b', fontSize: 12, fontStyle: 'italic' }}>
+                No telemetry loaded. The simulation is running from research-informed priors.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+
+function Kpi({ label, value, sub, color }) {
+  return (
+    <div style={kpiCardStyle}>
+      <div style={kpiLabelStyle}>{label}</div>
+      <div style={{ fontSize: 24, fontWeight: 700, color, marginTop: 4, fontFamily: 'monospace' }}>{value}</div>
+      <div style={kpiSubStyle}>{sub}</div>
+    </div>
+  );
+}
+
+function ControlRange({ label, min, max, step, value, onChange }) {
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <label style={labelStyle}>{label}</label>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={e => onChange(parseFloat(e.target.value))}
+        style={{ width: '100%', accentColor: '#38bdf8' }}
+      />
+    </div>
+  );
+}
+
+function NumberControl({ label, value, step, min, max, onChange }) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <label style={labelStyle}>{label}</label>
+      <input
+        type="number"
+        value={value}
+        step={step}
+        min={min}
+        max={max}
+        onChange={e => onChange(parseFloat(e.target.value))}
+        style={inputNumberStyle}
+      />
+    </div>
+  );
+}
+
+function TextControl({ label, value, onChange }) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <label style={labelStyle}>{label}</label>
+      <input type="text" value={value} onChange={e => onChange(e.target.value)} style={inputTextStyle} />
+    </div>
+  );
+}
+
+function SelectControl({ label, value, onChange, options }) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <label style={labelStyle}>{label}</label>
+      <select value={value} onChange={e => onChange(e.target.value)} style={inputTextStyle}>
+        {options.map(([v, text]) => <option key={v} value={v}>{text}</option>)}
+      </select>
+    </div>
+  );
+}
+
+const headerStyle = {
+  borderBottom: '1px solid #1e2433',
+  paddingBottom: 16,
+  marginBottom: 20
+};
+
+const badgeStyle = {
+  display: 'inline-block',
+  fontSize: 11,
+  fontWeight: 700,
+  letterSpacing: '0.6px',
+  background: '#1e293b',
+  color: '#38bdf8',
+  padding: '2px 8px',
+  borderRadius: 4,
+  border: '1px solid #334155'
+};
+
+const monoSubStyle = {
+  fontSize: 13,
+  color: '#94a3b8',
+  marginTop: 4,
+  fontFamily: 'monospace'
+};
+
+const kpiGridStyle = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
+  gap: 12,
+  marginBottom: 20
+};
+
+const kpiCardStyle = {
+  background: '#0e111a',
+  border: '1px solid #1e2433',
+  borderRadius: 8,
+  padding: '14px 16px'
+};
+
+const kpiLabelStyle = {
+  fontSize: 11,
+  fontWeight: 600,
+  color: '#64748b',
+  textTransform: 'uppercase',
+  letterSpacing: '0.5px'
+};
+
+const kpiSubStyle = {
+  fontSize: 11,
+  color: '#64748b',
+  marginTop: 3
+};
+
+const tabsStyle = {
+  display: 'flex',
+  gap: 4,
+  borderBottom: '1px solid #1e2433',
+  marginBottom: 18,
+  flexWrap: 'wrap'
+};
+
+const tabStyle = active => ({
+  background: 'transparent',
+  border: 'none',
+  borderBottom: active ? '2px solid #38bdf8' : '2px solid transparent',
+  color: active ? '#38bdf8' : '#64748b',
+  padding: '8px 14px',
+  fontSize: 12,
+  fontWeight: 600,
+  cursor: 'pointer'
+});
+
+const responsiveTwoColStyle = {
+  display: 'grid',
+  gridTemplateColumns: 'minmax(300px, 340px) minmax(0, 1fr)',
+  gap: 20
+};
+
+const panelStyle = {
+  background: '#0e111a',
+  border: '1px solid #1e2433',
+  borderRadius: 8,
+  padding: 16,
+  minWidth: 0,
+  boxSizing: 'border-box'
+};
+
+const sectionHeadingStyle = {
+  margin: '0 0 12px',
+  fontSize: 13,
+  fontWeight: 700,
+  color: '#f8fafc',
+  borderBottom: '1px solid #1e2433',
+  paddingBottom: 6
+};
+
+const labelStyle = {
+  fontSize: 11,
+  color: '#94a3b8',
+  display: 'block',
+  marginBottom: 4,
+  fontWeight: 500
+};
+
+const inputNumberStyle = {
+  width: '100%',
+  padding: '7px 10px',
+  background: '#090a0f',
+  border: '1px solid #1e2433',
+  borderRadius: 6,
+  color: '#f8fafc',
+  fontSize: 12,
+  fontFamily: 'monospace',
+  boxSizing: 'border-box'
+};
+
+const inputTextStyle = {
+  width: '100%',
+  padding: '7px 10px',
+  background: '#090a0f',
+  border: '1px solid #1e2433',
+  borderRadius: 6,
+  color: '#f8fafc',
+  fontSize: 12,
+  boxSizing: 'border-box'
+};
+
+const twoColInputStyle = {
+  display: 'grid',
+  gridTemplateColumns: '1fr 1fr',
+  gap: 12
+};
+
+const chartHeaderStyle = {
+  display: 'flex',
+  justifyContent: 'space-between',
+  alignItems: 'center',
+  marginBottom: 12,
+  gap: 12,
+  flexWrap: 'wrap'
+};
+
+const chartTitleStyle = {
+  margin: 0,
+  fontSize: 14,
+  fontWeight: 700,
+  color: '#f8fafc'
+};
+
+const mutedTextStyle = {
+  fontSize: 11,
+  color: '#64748b',
+  marginTop: 3
+};
+
+const legendStyle = {
+  display: 'flex',
+  gap: 10,
+  fontSize: 10,
+  fontWeight: 600,
+  flexWrap: 'wrap'
+};
+
+const tooltipStyle = {
+  position: 'absolute',
+  top: 10,
+  right: 16,
+  background: '#131824',
+  border: '1px solid #334155',
+  borderRadius: 6,
+  padding: '8px 12px',
+  fontSize: 11,
+  fontFamily: 'monospace',
+  boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+  lineHeight: 1.55
+};
+
+const tableStyle = {
+  width: '100%',
+  fontSize: 11,
+  borderCollapse: 'collapse',
+  textAlign: 'left',
+  fontFamily: 'monospace',
+  minWidth: 760
+};
+
+const tableHeadStyle = {
+  borderBottom: '1px solid #1e2433',
+  color: '#64748b'
+};
+
+const tableRowStyle = eol => ({
+  borderBottom: '1px solid #131824',
+  color: eol ? '#f87171' : '#cbd5e1'
+});
+
+const derivedRowStyle = {
+  display: 'flex',
+  justifyContent: 'space-between',
+  gap: 12,
+  padding: '7px 0',
+  borderBottom: '1px solid #131824',
+  color: '#cbd5e1',
+  fontSize: 12
+};
+
+const infoBoxStyle = {
+  marginTop: 18,
+  padding: 12,
+  background: '#090a0f',
+  borderRadius: 6,
+  border: '1px solid #1e2433',
+  fontSize: 11,
+  color: '#94a3b8',
+  lineHeight: 1.55
+};
+
+const referenceTextStyle = {
+  fontSize: 12,
+  color: '#94a3b8',
+  lineHeight: 1.6
+};
+
+const mutedParagraphStyle = {
+  fontSize: 12,
+  color: '#94a3b8',
+  margin: '0 0 12px',
+  lineHeight: 1.5
+};
+
+const warningStyle = active => ({
+  fontSize: 10,
+  color: active ? '#fbbf24' : '#64748b',
+  margin: '-7px 0 12px'
+});
+
+const secondaryButtonStyle = {
+  marginTop: 14,
+  padding: '7px 10px',
+  borderRadius: 6,
+  border: '1px solid #334155',
+  background: '#131824',
+  color: '#cbd5e1',
+  cursor: 'pointer',
+  fontSize: 11
+};
+
+const errorBoxStyle = {
+  fontSize: 11,
+  color: '#f87171',
+  background: '#450a0a',
+  padding: '7px 9px',
+  borderRadius: 4,
+  marginTop: 10
+};
